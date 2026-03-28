@@ -63,8 +63,12 @@ export default function Dashboard({ project, users }) {
     if (!project) return;
     setLoading(true);
     fetch(`/api/projects/${project.id}/analytics`)
-      .then(r => r.json())
-      .then(data => { setAnalytics(data); setLoading(false); });
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(data => { setAnalytics(data); setLoading(false); })
+      .catch(err => { console.error('Failed to load analytics:', err); setLoading(false); });
   }, [project?.id]);
 
   if (!project) {
@@ -73,6 +77,10 @@ export default function Dashboard({ project, users }) {
 
   if (loading) {
     return <div className="empty-state">Loading analytics…</div>;
+  }
+
+  if (!analytics) {
+    return <div className="empty-state">Failed to load analytics. Please try again.</div>;
   }
 
   const { taskStats, priorityStats, assigneeStats, overdueCount, recentActivity } = analytics;

@@ -18,7 +18,7 @@ async function init() {
       name TEXT NOT NULL,
       email TEXT DEFAULT '',
       avatar_color TEXT DEFAULT '#4a9eff',
-      role TEXT DEFAULT 'member',
+      role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin', 'member', 'lead', 'manager', 'designer', 'developer')),
       created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS tasks (
