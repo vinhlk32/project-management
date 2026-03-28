@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ProjectList from './components/ProjectList';
 import TaskList from './components/TaskList';
 import Dashboard from './components/Dashboard';
+import UserAdmin from './components/UserAdmin';
 
 const AVATAR_COLORS = [
   '#4a9eff', '#8b5cf6', '#ec4899', '#06b6d4',
@@ -135,20 +136,20 @@ function TeamPanel({ users, onAdd, onDelete, currentUser, onSetCurrentUser, onCl
 export default function App() {
   const [projects, setProjects] = useState([]);
   const [selectedProject, setSelectedProject] = useState(null);
-  const [view, setView] = useState('board'); // 'board' | 'dashboard'
+  const [view, setView] = useState('board'); // 'board' | 'dashboard' | 'admin'
   const [users, setUsers] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [teamOpen, setTeamOpen] = useState(false);
 
   useEffect(() => {
     Promise.all([
-      fetch('/api/projects').then(r => r.json()),
-      fetch('/api/users').then(r => r.json()),
+      fetch('/api/projects').then(r => r.ok ? r.json() : []),
+      fetch('/api/users').then(r => r.ok ? r.json() : []),
     ]).then(([projectsData, usersData]) => {
       setProjects(projectsData);
       setUsers(usersData);
       if (projectsData.length > 0) setSelectedProject(projectsData[0]);
-    });
+    }).catch(err => console.error('Failed to load initial data:', err));
   }, []);
 
   const addProject = async (name) => {
@@ -157,6 +158,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     });
+    if (!res.ok) { console.error('Failed to create project'); return; }
     const project = await res.json();
     setProjects(prev => [project, ...prev]);
     setSelectedProject(project);
@@ -164,7 +166,8 @@ export default function App() {
   };
 
   const deleteProject = async (id) => {
-    await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+    if (!res.ok) { console.error('Failed to delete project'); return; }
     setProjects(prev => prev.filter(p => p.id !== id));
     if (selectedProject?.id === id) {
       setSelectedProject(projects.find(p => p.id !== id) || null);
@@ -177,14 +180,28 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
+    if (!res.ok) { console.error('Failed to create user'); return; }
     const user = await res.json();
     setUsers(prev => [...prev, user]);
   };
 
   const deleteUser = async (id) => {
-    await fetch(`/api/users/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/users/${id}`, { method: 'DELETE' });
+    if (!res.ok) { console.error('Failed to delete user'); return; }
     setUsers(prev => prev.filter(u => u.id !== id));
     if (currentUser?.id === id) setCurrentUser(null);
+  };
+
+  const updateUser = async (id, data) => {
+    const res = await fetch(`/api/users/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) { console.error('Failed to update user'); return; }
+    const updated = await res.json();
+    setUsers(prev => prev.map(u => u.id === id ? updated : u));
+    if (currentUser?.id === id) setCurrentUser(updated);
   };
 
   const handleSelectProject = (project) => {
@@ -211,6 +228,12 @@ export default function App() {
             onClick={() => setView('board')}
           >
             Board
+          </button>
+          <button
+            className={`nav-btn${view === 'admin' ? ' active' : ''}`}
+            onClick={() => setView('admin')}
+          >
+            Admin
           </button>
         </nav>
         <div className="header-right">
@@ -247,6 +270,14 @@ export default function App() {
                   currentUser={currentUser}
                 />
               : <div className="empty-state">Select or create a project to get started.</div>
+          )}
+          {view === 'admin' && (
+            <UserAdmin
+              users={users}
+              onAdd={addUser}
+              onUpdate={updateUser}
+              onDelete={deleteUser}
+            />
           )}
         </main>
       </div>

@@ -51,8 +51,9 @@ export default function TaskList({ project, users = [], currentUser }) {
 
   useEffect(() => {
     fetch(`/api/projects/${project.id}/tasks`)
-      .then(r => r.json())
-      .then(setTasks);
+      .then(r => r.ok ? r.json() : [])
+      .then(setTasks)
+      .catch(err => console.error('Failed to load tasks:', err));
   }, [project.id]);
 
   const applyAffected = (affected) => {
@@ -67,6 +68,7 @@ export default function TaskList({ project, users = [], currentUser }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
+      if (!res.ok) { console.error('Failed to update task'); closeModal(); return; }
       const { task: updated, affected } = await res.json();
       setTasks(prev => prev.map(t => t.id === updated.id ? updated : t));
       applyAffected(affected);
@@ -76,6 +78,7 @@ export default function TaskList({ project, users = [], currentUser }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...data, project_id: project.id }),
       });
+      if (!res.ok) { console.error('Failed to create task'); closeModal(); return; }
       const created = await res.json();
       setTasks(prev => [created, ...prev]);
     }
@@ -85,8 +88,9 @@ export default function TaskList({ project, users = [], currentUser }) {
   saveTask.__affectedUpdate = applyAffected;
 
   const deleteTask = async (id) => {
-    await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
-    setTasks(prev => prev.filter(t => t.id !== id));
+    const res = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+    if (res.ok) setTasks(prev => prev.filter(t => t.id !== id));
+    else console.error('Failed to delete task');
   };
 
   const openEdit  = (task) => { setEditingTask(task); setModalOpen(true); };

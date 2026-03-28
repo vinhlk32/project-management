@@ -35,8 +35,12 @@ export default function CommentSection({ taskId, users, currentUser }) {
   useEffect(() => {
     if (!taskId) return;
     fetch(`/api/tasks/${taskId}/comments`)
-      .then(r => r.json())
-      .then(setComments);
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(setComments)
+      .catch(err => console.error('Failed to load comments:', err));
   }, [taskId]);
 
   useEffect(() => {
@@ -65,8 +69,12 @@ export default function CommentSection({ taskId, users, currentUser }) {
   };
 
   const deleteComment = async (id) => {
-    await fetch(`/api/comments/${id}`, { method: 'DELETE' });
-    setComments(prev => prev.filter(c => c.id !== id));
+    const res = await fetch(`/api/comments/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      setComments(prev => prev.filter(c => c.id !== id));
+    } else {
+      console.error('Failed to delete comment');
+    }
   };
 
   return (
