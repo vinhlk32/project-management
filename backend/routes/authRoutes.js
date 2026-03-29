@@ -72,37 +72,40 @@ router.post('/login', async (req, res) => {
 
     const user = result.rows[0];
 
+    // Always run bcrypt to prevent user-enumeration via timing differences.
+    // Use a dummy hash when the user doesn't exist or has no password set yet.
+    const DUMMY_HASH = '$2b$12$invalidhashfortimingXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX.u';
+    const hashToCompare = user?.password_hash || DUMMY_HASH;
+    const passwordMatch = await bcrypt.compare(password, hashToCompare);
+
     if (!user) {
-      await logAudit(db, { action: 'login_failed', ip, userAgent, detail: { reason: 'user_not_found', email: email.trim() } });
+      await logAudit(db, { action: 'login_failed', ip, userAgent, detail: { reason: 'user_not_found' } });
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
     if (user.is_active === 0) {
-      return res.status(403).json({ error: 'Account deactivated' });
-    }
-
-    if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      return res.status(423).json({ error: `Account locked. Try again after ${user.locked_until}` });
-    }
-
-    if (!user.password_hash) {
-      await logAudit(db, { userId: user.id, action: 'login_failed', ip, userAgent, detail: { reason: 'no_password_set' } });
+      await logAudit(db, { userId: user.id, action: 'login_failed', ip, userAgent, detail: { reason: 'account_deactivated' } });
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      await logAudit(db, { userId: user.id, action: 'login_failed', ip, userAgent, detail: { reason: 'account_locked' } });
+      return res.status(401).json({ error: 'Invalid email or password. Account temporarily locked.' });
+    }
 
-    if (!passwordMatch) {
+    if (!user.password_hash || !passwordMatch) {
       const newAttempts = (user.failed_attempts || 0) + 1;
       let lockUntil = null;
       if (newAttempts >= 5) {
         lockUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+        await logAudit(db, { userId: user.id, action: 'account_locked', ip, userAgent, detail: { attempts: newAttempts } });
       }
       await db.execute({
         sql: 'UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?',
         args: [newAttempts, lockUntil, user.id],
       });
-      await logAudit(db, { userId: user.id, action: 'login_failed', ip, userAgent, detail: { reason: 'wrong_password', attempts: newAttempts } });
+      const reason = !user.password_hash ? 'no_password_set' : 'wrong_password';
+      await logAudit(db, { userId: user.id, action: 'login_failed', ip, userAgent, detail: { reason, attempts: newAttempts } });
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 

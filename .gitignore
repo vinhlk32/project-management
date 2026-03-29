@@ -3,3 +3,8 @@ backend/data.db
 *.log
 dist/
 .DS_Store
+
+# Environment secrets — never commit
+.env
+.env.local
+.env.*.local

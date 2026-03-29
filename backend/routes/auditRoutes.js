@@ -4,11 +4,21 @@ const router = express.Router();
 const requireAuth = require('../middleware/requireAuth');
 const requireRole = require('../middleware/requireRole');
 
+const VALID_AUDIT_ACTIONS = [
+  'login_success', 'login_failed', 'logout', 'account_locked', 'password_changed',
+  'project_created', 'project_updated', 'project_deleted',
+  'task_created', 'task_updated', 'task_deleted',
+  'user_created', 'user_updated', 'user_deleted',
+  'comment_created', 'comment_deleted',
+];
+
 // GET /api/audit-logs
 router.get('/audit-logs', requireAuth, requireRole('admin'), async (req, res) => {
   const db = req.db;
 
-  const { userId, action, from, to } = req.query;
+  const { userId, from, to } = req.query;
+  const action = req.query.action && VALID_AUDIT_ACTIONS.includes(req.query.action)
+    ? req.query.action : null;
   const limit = Math.min(Number(req.query.limit) || 50, 200);
   const offset = Number(req.query.offset) || 0;
 

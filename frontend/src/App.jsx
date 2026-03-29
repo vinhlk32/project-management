@@ -103,12 +103,14 @@ export default function App() {
           >
             Board
           </button>
-          <button
-            className={`nav-btn${view === 'admin' ? ' active' : ''}`}
-            onClick={() => setView('admin')}
-          >
-            Admin
-          </button>
+          {currentUser.role === 'admin' && (
+            <button
+              className={`nav-btn${view === 'admin' ? ' active' : ''}`}
+              onClick={() => setView('admin')}
+            >
+              Admin
+            </button>
+          )}
           {currentUser.role === 'admin' && (
             <button
               className={`nav-btn${view === 'audit' ? ' active' : ''}`}

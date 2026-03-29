@@ -18,6 +18,10 @@ const app = express();
 app.use(helmet());
 
 // ── CORS – restrict to the frontend origin only ───────────────────────────────
+// Fail fast in production if FRONTEND_URL is not explicitly configured
+if (process.env.NODE_ENV === 'production' && !process.env.FRONTEND_URL) {
+  throw new Error('FRONTEND_URL environment variable must be set in production');
+}
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -184,7 +188,12 @@ app.delete('/api/projects/:id', async (req, res) => {
 
 app.get('/api/users', async (req, res) => {
   try {
-    const result = await db.execute('SELECT id, name, email, avatar_color, role, is_active, locked_until, created_at FROM users ORDER BY name ASC');
+    const isAdmin = req.user?.role === 'admin';
+    // Admins see security fields; regular users see only what they need for task assignment
+    const sql = isAdmin
+      ? 'SELECT id, name, email, avatar_color, role, is_active, locked_until, failed_attempts, created_at FROM users ORDER BY name ASC'
+      : 'SELECT id, name, email, avatar_color, role, created_at FROM users WHERE is_active = 1 ORDER BY name ASC';
+    const result = await db.execute(sql);
     res.json(result.rows);
   } catch (err) { handleError(res, err); }
 });
@@ -202,7 +211,7 @@ app.post('/api/users', requireRole('admin'), async (req, res) => {
 
     const result = await db.execute({
       sql: 'INSERT INTO users (name, email, avatar_color, role) VALUES (?, ?, ?, ?)',
-      args: [name.trim(), (email || '').trim(), avatar_color || '#4a9eff', role || 'member'],
+      args: [name.trim(), (email || '').trim().toLowerCase(), avatar_color || '#4a9eff', role || 'member'],
     });
     const row = await db.execute({
       sql: 'SELECT id, name, email, avatar_color, role, is_active, locked_until, created_at FROM users WHERE id = ?',
@@ -233,7 +242,7 @@ app.put('/api/users/:id', requireRole('admin'), async (req, res) => {
 
     const u = current.rows[0];
     const newName = name?.trim() || u.name;
-    const newEmail = email !== undefined ? (email || '').trim() : u.email;
+    const newEmail = email !== undefined ? (email || '').trim().toLowerCase() : u.email;
     const newAvatarColor = avatar_color || u.avatar_color;
     const newRole = (role && VALID_ROLES.includes(role)) ? role : u.role;
     const newIsActive = is_active !== undefined ? (is_active ? 1 : 0) : u.is_active;
