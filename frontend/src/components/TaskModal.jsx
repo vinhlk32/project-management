@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import CommentSection from './CommentSection';
+import { useAuth } from '../context/AuthContext';
 
 const DEP_TYPES = ['FS', 'SS', 'FF', 'SF'];
 const DEP_LABELS = {
@@ -46,7 +47,9 @@ function Avatar({ name, color, size = 26 }) {
   );
 }
 
-export default function TaskModal({ task, projectTasks, users = [], currentUser, onSave, onClose }) {
+export default function TaskModal({ task, projectTasks, users = [], currentUser: currentUserProp, onSave, onClose }) {
+  const { authFetch, currentUser: authCurrentUser } = useAuth();
+  const currentUser = currentUserProp || authCurrentUser;
   const [activeTab, setActiveTab] = useState('details');
   const [title, setTitle] = useState(task?.title || '');
   const [description, setDescription] = useState(task?.description || '');
@@ -68,7 +71,7 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser,
 
   useEffect(() => {
     if (!task?.id) return;
-    fetch(`/api/tasks/${task.id}/dependencies`)
+    authFetch(`/api/tasks/${task.id}/dependencies`)
       .then(r => r.json())
       .then(setDeps);
   }, [task?.id]);
@@ -102,9 +105,8 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser,
   const addDependency = async () => {
     setDepError('');
     if (!newDep.predecessor_id) return;
-    const res = await fetch(`/api/tasks/${task.id}/dependencies`, {
+    const res = await authFetch(`/api/tasks/${task.id}/dependencies`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         predecessor_id: Number(newDep.predecessor_id),
         type: newDep.type,
@@ -129,7 +131,7 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser,
   };
 
   const removeDependency = async (depId) => {
-    await fetch(`/api/dependencies/${depId}`, { method: 'DELETE' });
+    await authFetch(`/api/dependencies/${depId}`, { method: 'DELETE' });
     setDeps(prev => prev.filter(d => d.id !== depId));
   };
 

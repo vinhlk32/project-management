@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { useAuth } from '../context/AuthContext';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const HEADER_H = 52;   // 2 rows × 26 px
@@ -114,6 +115,7 @@ function arrowPath(type, pred, succ) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function GanttChart({ project, tasks, onEditTask, refreshKey }) {
+  const { authFetch } = useAuth();
   const [zoom, setZoom] = useState('week');
   const [deps, setDeps] = useState([]);
   const scrollRef    = useRef(null);
@@ -123,7 +125,7 @@ export default function GanttChart({ project, tasks, onEditTask, refreshKey }) {
 
   // Re-fetch deps whenever deps may have changed (modal close triggers refreshKey bump)
   useEffect(() => {
-    fetch(`/api/projects/${project.id}/dependencies`)
+    authFetch(`/api/projects/${project.id}/dependencies`)
       .then(r => r.json())
       .then(setDeps);
   }, [project.id, refreshKey]);

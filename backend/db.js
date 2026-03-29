@@ -5,7 +5,7 @@ const db = createClient({
   url: `file:${path.join(__dirname, 'data.db')}`,
 });
 
-async function init() {
+async function initializeDatabase() {
   await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS projects (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +58,34 @@ async function init() {
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
     );
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      revoked INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS token_blacklist (
+      jti TEXT PRIMARY KEY,
+      expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      action TEXT NOT NULL,
+      entity_type TEXT,
+      entity_id INTEGER,
+      ip_address TEXT,
+      user_agent TEXT,
+      detail TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_al_user_id ON audit_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_al_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_al_created ON audit_logs(created_at);
     PRAGMA foreign_keys = ON;
   `);
 
@@ -70,6 +98,10 @@ async function init() {
     'ALTER TABLE tasks ADD COLUMN estimated_hours REAL DEFAULT 0',
     'ALTER TABLE tasks ADD COLUMN logged_hours REAL DEFAULT 0',
     'ALTER TABLE projects ADD COLUMN description TEXT DEFAULT \'\'',
+    'ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT NULL',
+    'ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1',
+    'ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE users ADD COLUMN locked_until TEXT DEFAULT NULL',
   ];
 
   for (const sql of migrations) {
@@ -81,4 +113,25 @@ async function init() {
   }
 }
 
-module.exports = { db, init };
+async function cleanupExpiredTokens() {
+  const now = new Date().toISOString();
+  try {
+    await db.execute({
+      sql: 'DELETE FROM token_blacklist WHERE expires_at < ?',
+      args: [now],
+    });
+    await db.execute({
+      sql: 'DELETE FROM refresh_tokens WHERE expires_at < ?',
+      args: [now],
+    });
+  } catch (e) {
+    console.error('Token cleanup failed:', e.message);
+  }
+}
+
+// Keep legacy `init` export for backward compatibility
+async function init() {
+  return initializeDatabase();
+}
+
+module.exports = { db, init, initializeDatabase, cleanupExpiredTokens };
