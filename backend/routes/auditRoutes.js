@@ -51,14 +51,15 @@ router.get('/audit-logs', requireAuth, requireRole('admin'), async (req, res) =>
     });
     const total = countResult.rows[0]?.total ?? 0;
 
+    // LIMIT/OFFSET are validated integers — safe to inline (avoids mysql2 prepared-stmt limitation)
     const logsResult = await db.execute({
       sql: `SELECT al.*, u.name AS user_name
             FROM audit_logs al
             LEFT JOIN users u ON u.id = al.user_id
             ${where}
             ORDER BY al.created_at DESC
-            LIMIT ? OFFSET ?`,
-      args: [...args, limit, offset],
+            LIMIT ${limit} OFFSET ${offset}`,
+      args,
     });
 
     return res.json({ total, logs: logsResult.rows });

@@ -15,12 +15,9 @@ export default function App() {
   const [view, setView] = useState('board'); // 'board' | 'dashboard' | 'admin' | 'audit'
   const [users, setUsers] = useState([]);
 
-  // Show login if not authenticated
-  if (!currentUser) {
-    return <LoginPage />;
-  }
-
+  // Load data after login — must be declared before any early return
   useEffect(() => {
+    if (!currentUser) return;
     Promise.all([
       authFetch('/api/projects').then(r => r.ok ? r.json() : []),
       authFetch('/api/users').then(r => r.ok ? r.json() : []),
@@ -29,7 +26,12 @@ export default function App() {
       setUsers(usersData);
       if (projectsData.length > 0) setSelectedProject(projectsData[0]);
     }).catch(err => console.error('Failed to load initial data:', err));
-  }, []);
+  }, [currentUser]);
+
+  // Show login page if not authenticated
+  if (!currentUser) {
+    return <LoginPage />;
+  }
 
   const addProject = async (name) => {
     const res = await authFetch('/api/projects', {

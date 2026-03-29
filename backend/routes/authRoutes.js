@@ -15,6 +15,11 @@ const { logAudit } = require('../audit');
 
 const IS_PROD = process.env.NODE_ENV === 'production';
 
+// MySQL requires 'YYYY-MM-DD HH:MM:SS', not ISO-8601 'Z' strings
+function toMySQLDatetime(date) {
+  return date.toISOString().replace('T', ' ').slice(0, 19);
+}
+
 function setCookies(res, accessToken, refreshToken, csrfToken) {
   const accessExpiry = new Date(Date.now() + 15 * 60 * 1000);
   const refreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -120,7 +125,7 @@ router.post('/login', async (req, res) => {
     const csrfToken = uuidv4();
 
     // Store hashed refresh token
-    const refreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const refreshExpiry = toMySQLDatetime(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     await db.execute({
       sql: 'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)',
       args: [user.id, hashToken(refreshToken), refreshExpiry],
@@ -151,7 +156,7 @@ router.post('/logout', requireAuth, async (req, res) => {
     // Blacklist current access token
     const payload = req.user;
     if (payload?.jti && payload?.exp) {
-      await blacklistToken(db, payload.jti, new Date(payload.exp * 1000).toISOString());
+      await blacklistToken(db, payload.jti, toMySQLDatetime(new Date(payload.exp * 1000)));
     }
 
     // Revoke refresh token if present
@@ -215,7 +220,7 @@ router.post('/refresh', async (req, res) => {
 
     // Rotate refresh token
     const newRefreshToken = signRefreshToken(user.id);
-    const newRefreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const newRefreshExpiry = toMySQLDatetime(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
 
     await db.execute({
       sql: 'DELETE FROM refresh_tokens WHERE token_hash = ?',

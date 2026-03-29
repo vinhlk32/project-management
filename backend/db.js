@@ -58,7 +58,7 @@ async function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS projects (
         id          INT          NOT NULL AUTO_INCREMENT,
         name        VARCHAR(200) NOT NULL,
-        description TEXT         NOT NULL DEFAULT '',
+        description TEXT,
         created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -90,7 +90,7 @@ async function initializeDatabase() {
         id              INT          NOT NULL AUTO_INCREMENT,
         project_id      INT          NOT NULL,
         title           VARCHAR(300) NOT NULL,
-        description     TEXT         NOT NULL DEFAULT '',
+        description     TEXT,
         status          ENUM('todo','in-progress','done')      NOT NULL DEFAULT 'todo',
         priority        ENUM('low','medium','high','critical')  NOT NULL DEFAULT 'medium',
         assignee_id     INT          DEFAULT NULL,
@@ -119,7 +119,7 @@ async function initializeDatabase() {
         predecessor_id INT NOT NULL,
         successor_id   INT NOT NULL,
         type           ENUM('FS','SF','SS','FF') NOT NULL DEFAULT 'FS',
-        lag            INT NOT NULL DEFAULT 0,
+        \`lag\`         INT NOT NULL DEFAULT 0,
         PRIMARY KEY (id),
         UNIQUE KEY uq_dep (predecessor_id, successor_id),
         CONSTRAINT fk_dep_predecessor FOREIGN KEY (predecessor_id)

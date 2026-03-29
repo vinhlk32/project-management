@@ -515,7 +515,7 @@ app.post('/api/tasks/:id/dependencies', async (req, res) => {
     }
 
     const result = await db.execute({
-      sql: 'INSERT INTO task_dependencies (predecessor_id, successor_id, type, lag) VALUES (?, ?, ?, ?)',
+      sql: 'INSERT INTO task_dependencies (predecessor_id, successor_id, type, `lag`) VALUES (?, ?, ?, ?)',
       args: [predecessor_id, successorId, type || 'FS', lagVal],
     });
     const row = await db.execute({
