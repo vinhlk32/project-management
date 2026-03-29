@@ -40,7 +40,7 @@ async function isBlacklisted(db, jti) {
 
 async function blacklistToken(db, jti, expiresAt) {
   await db.execute({
-    sql: 'INSERT OR IGNORE INTO token_blacklist (jti, expires_at) VALUES (?, ?)',
+    sql: 'INSERT IGNORE INTO token_blacklist (jti, expires_at) VALUES (?, ?)',
     args: [jti, expiresAt],
   });
 }

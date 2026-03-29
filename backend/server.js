@@ -94,6 +94,9 @@ function handleError(res, err) {
   res.status(500).json({ error: 'Internal server error' });
 }
 
+// ── Health check (no auth, no DB — used by ALB & Docker HEALTHCHECK) ─────────
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
 // ── Auth routes (mounted before requireAuth so login/refresh/etc work) ────────
 app.use('/api/auth', loginLimiter, authRoutes);
 

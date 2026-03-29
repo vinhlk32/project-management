@@ -1,137 +1,217 @@
-const { createClient } = require('@libsql/client');
-const path = require('path');
+const mysql = require('mysql2/promise');
 
-const db = createClient({
-  url: `file:${path.join(__dirname, 'data.db')}`,
-});
+let pool;
 
-async function initializeDatabase() {
-  await db.executeMultiple(`
-    CREATE TABLE IF NOT EXISTS projects (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT DEFAULT '',
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT DEFAULT '',
-      avatar_color TEXT DEFAULT '#4a9eff',
-      role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin', 'member', 'lead', 'manager', 'designer', 'developer')),
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo', 'in-progress', 'done')),
-      priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high', 'critical')),
-      assignee_id INTEGER,
-      labels TEXT DEFAULT '',
-      start_date TEXT,
-      due_date TEXT,
-      estimated_hours REAL DEFAULT 0,
-      logged_hours REAL DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      FOREIGN KEY (assignee_id) REFERENCES users(id) ON DELETE SET NULL
-    );
-    CREATE TABLE IF NOT EXISTS task_dependencies (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      predecessor_id INTEGER NOT NULL,
-      successor_id INTEGER NOT NULL,
-      type TEXT NOT NULL DEFAULT 'FS' CHECK(type IN ('FS', 'SF', 'SS', 'FF')),
-      lag INTEGER DEFAULT 0,
-      FOREIGN KEY (predecessor_id) REFERENCES tasks(id) ON DELETE CASCADE,
-      FOREIGN KEY (successor_id) REFERENCES tasks(id) ON DELETE CASCADE,
-      UNIQUE(predecessor_id, successor_id)
-    );
-    CREATE TABLE IF NOT EXISTS comments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id INTEGER NOT NULL,
-      user_id INTEGER,
-      author_name TEXT DEFAULT 'Anonymous',
-      content TEXT NOT NULL,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-    );
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE,
-      expires_at TEXT NOT NULL,
-      created_at TEXT DEFAULT (datetime('now')),
-      revoked INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS token_blacklist (
-      jti TEXT PRIMARY KEY,
-      expires_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,
-      action TEXT NOT NULL,
-      entity_type TEXT,
-      entity_id INTEGER,
-      ip_address TEXT,
-      user_agent TEXT,
-      detail TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_al_user_id ON audit_logs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_al_action ON audit_logs(action);
-    CREATE INDEX IF NOT EXISTS idx_al_created ON audit_logs(created_at);
-    PRAGMA foreign_keys = ON;
-  `);
+function getPool() {
+  if (!pool) {
+    pool = mysql.createPool({
+      host:               process.env.DB_HOST     || 'localhost',
+      port:               Number(process.env.DB_PORT) || 3306,
+      database:           process.env.DB_NAME     || 'projectmanager',
+      user:               process.env.DB_USER     || 'root',
+      password:           process.env.DB_PASSWORD || '',
+      waitForConnections: true,
+      connectionLimit:    10,
+      queueLimit:         0,
+      dateStrings:        true, // return DATE/DATETIME as strings, not JS Date objects
+      ssl: process.env.NODE_ENV === 'production'
+        ? { rejectUnauthorized: true }
+        : false,
+    });
+  }
+  return pool;
+}
 
-  // Migrations for existing databases
-  const migrations = [
-    'ALTER TABLE tasks ADD COLUMN start_date TEXT',
-    'ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT \'medium\'',
-    'ALTER TABLE tasks ADD COLUMN assignee_id INTEGER',
-    'ALTER TABLE tasks ADD COLUMN labels TEXT DEFAULT \'\'',
-    'ALTER TABLE tasks ADD COLUMN estimated_hours REAL DEFAULT 0',
-    'ALTER TABLE tasks ADD COLUMN logged_hours REAL DEFAULT 0',
-    'ALTER TABLE projects ADD COLUMN description TEXT DEFAULT \'\'',
-    'ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT NULL',
-    'ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1',
-    'ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0',
-    'ALTER TABLE users ADD COLUMN locked_until TEXT DEFAULT NULL',
-  ];
+// ── Adapter ───────────────────────────────────────────────────────────────────
+// Normalises mysql2 output to the { rows, lastInsertRowid } shape used
+// throughout the codebase so every call-site works without modification.
+const db = {
+  async execute(queryOrString) {
+    const p = getPool();
+    let sql, args;
 
-  for (const sql of migrations) {
-    try {
-      await db.execute(sql);
-    } catch (_) {
-      // Column already exists — safe to ignore
+    if (typeof queryOrString === 'string') {
+      sql  = queryOrString;
+      args = [];
+    } else {
+      sql  = queryOrString.sql;
+      args = (queryOrString.args || []).map(v => (v === undefined ? null : v));
     }
+
+    const [rows] = await p.execute(sql, args);
+
+    // SELECT → rows is an array; INSERT/UPDATE/DELETE → ResultSetHeader object
+    if (Array.isArray(rows)) {
+      return { rows, lastInsertRowid: null };
+    }
+    return { rows: [], lastInsertRowid: rows.insertId || null };
+  },
+};
+
+// ── Schema initialisation ─────────────────────────────────────────────────────
+async function initializeDatabase() {
+  const p   = getPool();
+  const conn = await p.getConnection();
+  try {
+    // projects
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id          INT          NOT NULL AUTO_INCREMENT,
+        name        VARCHAR(200) NOT NULL,
+        description TEXT         NOT NULL DEFAULT '',
+        created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // users
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id              INT          NOT NULL AUTO_INCREMENT,
+        name            VARCHAR(100) NOT NULL,
+        email           VARCHAR(254) NOT NULL DEFAULT '',
+        avatar_color    VARCHAR(20)  NOT NULL DEFAULT '#4a9eff',
+        role            ENUM('admin','member','lead','manager','designer','developer')
+                                     NOT NULL DEFAULT 'member',
+        password_hash   VARCHAR(255) DEFAULT NULL,
+        is_active       TINYINT(1)   NOT NULL DEFAULT 1,
+        failed_attempts INT          NOT NULL DEFAULT 0,
+        locked_until    DATETIME     DEFAULT NULL,
+        created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_users_email     (email),
+        INDEX idx_users_is_active (is_active)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // tasks
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id              INT          NOT NULL AUTO_INCREMENT,
+        project_id      INT          NOT NULL,
+        title           VARCHAR(300) NOT NULL,
+        description     TEXT         NOT NULL DEFAULT '',
+        status          ENUM('todo','in-progress','done')      NOT NULL DEFAULT 'todo',
+        priority        ENUM('low','medium','high','critical')  NOT NULL DEFAULT 'medium',
+        assignee_id     INT          DEFAULT NULL,
+        labels          VARCHAR(500) NOT NULL DEFAULT '',
+        start_date      DATE         DEFAULT NULL,
+        due_date        DATE         DEFAULT NULL,
+        estimated_hours DECIMAL(7,2) NOT NULL DEFAULT 0.00,
+        logged_hours    DECIMAL(7,2) NOT NULL DEFAULT 0.00,
+        created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_tasks_project_id  (project_id),
+        INDEX idx_tasks_assignee_id (assignee_id),
+        INDEX idx_tasks_status      (status),
+        INDEX idx_tasks_due_date    (due_date),
+        CONSTRAINT fk_tasks_project  FOREIGN KEY (project_id)
+          REFERENCES projects(id) ON DELETE CASCADE,
+        CONSTRAINT fk_tasks_assignee FOREIGN KEY (assignee_id)
+          REFERENCES users(id)    ON DELETE SET NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // task_dependencies
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS task_dependencies (
+        id             INT NOT NULL AUTO_INCREMENT,
+        predecessor_id INT NOT NULL,
+        successor_id   INT NOT NULL,
+        type           ENUM('FS','SF','SS','FF') NOT NULL DEFAULT 'FS',
+        lag            INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_dep (predecessor_id, successor_id),
+        CONSTRAINT fk_dep_predecessor FOREIGN KEY (predecessor_id)
+          REFERENCES tasks(id) ON DELETE CASCADE,
+        CONSTRAINT fk_dep_successor   FOREIGN KEY (successor_id)
+          REFERENCES tasks(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+
+    // comments
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS comments (
+        id          INT          NOT NULL AUTO_INCREMENT,
+        task_id     INT          NOT NULL,
+        user_id     INT          DEFAULT NULL,
+        author_name VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
+        content     TEXT         NOT NULL,
+        created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_comments_task_id (task_id),
+        CONSTRAINT fk_comments_task FOREIGN KEY (task_id)
+          REFERENCES tasks(id)  ON DELETE CASCADE,
+        CONSTRAINT fk_comments_user FOREIGN KEY (user_id)
+          REFERENCES users(id)  ON DELETE SET NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // refresh_tokens
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id         INT         NOT NULL AUTO_INCREMENT,
+        user_id    INT         NOT NULL,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at DATETIME    NOT NULL,
+        created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        revoked    TINYINT(1)  NOT NULL DEFAULT 0,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_token_hash (token_hash),
+        INDEX idx_rt_user_id (user_id),
+        CONSTRAINT fk_rt_user FOREIGN KEY (user_id)
+          REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+
+    // token_blacklist
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS token_blacklist (
+        jti        VARCHAR(36) NOT NULL,
+        expires_at DATETIME    NOT NULL,
+        PRIMARY KEY (jti),
+        INDEX idx_tb_expires_at (expires_at)
+      ) ENGINE=InnoDB
+    `);
+
+    // audit_logs
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id          INT          NOT NULL AUTO_INCREMENT,
+        user_id     INT          DEFAULT NULL,
+        action      VARCHAR(50)  NOT NULL,
+        entity_type VARCHAR(50)  DEFAULT NULL,
+        entity_id   INT          DEFAULT NULL,
+        ip_address  VARCHAR(45)  DEFAULT NULL,
+        user_agent  VARCHAR(500) DEFAULT NULL,
+        detail      JSON         DEFAULT NULL,
+        created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_al_user_id (user_id),
+        INDEX idx_al_action  (action),
+        INDEX idx_al_created (created_at),
+        CONSTRAINT fk_al_user FOREIGN KEY (user_id)
+          REFERENCES users(id) ON DELETE SET NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    console.log('✅ Database initialised successfully');
+  } finally {
+    conn.release();
   }
 }
 
+// ── Token cleanup ─────────────────────────────────────────────────────────────
 async function cleanupExpiredTokens() {
-  const now = new Date().toISOString();
   try {
-    await db.execute({
-      sql: 'DELETE FROM token_blacklist WHERE expires_at < ?',
-      args: [now],
-    });
-    await db.execute({
-      sql: 'DELETE FROM refresh_tokens WHERE expires_at < ?',
-      args: [now],
-    });
+    await db.execute({ sql: 'DELETE FROM token_blacklist WHERE expires_at < NOW()', args: [] });
+    await db.execute({ sql: 'DELETE FROM refresh_tokens  WHERE expires_at < NOW() OR revoked = 1', args: [] });
   } catch (e) {
     console.error('Token cleanup failed:', e.message);
   }
 }
 
-// Keep legacy `init` export for backward compatibility
-async function init() {
-  return initializeDatabase();
-}
+// Keep legacy alias
+async function init() { return initializeDatabase(); }
 
 module.exports = { db, init, initializeDatabase, cleanupExpiredTokens };
