@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useAuth } from '../context/AuthContext';
 
 const PRIORITY_COLORS = {
   low: '#22c55e',
@@ -56,13 +57,14 @@ function formatTime(dateStr) {
 }
 
 export default function Dashboard({ project, users }) {
+  const { authFetch } = useAuth();
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!project) return;
     setLoading(true);
-    fetch(`/api/projects/${project.id}/analytics`)
+    authFetch(`/api/projects/${project.id}/analytics`)
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();

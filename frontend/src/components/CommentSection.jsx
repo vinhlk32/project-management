@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useAuth } from '../context/AuthContext';
 
 function Avatar({ name, color, size = 28 }) {
   const initials = name ? name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase() : '?';
@@ -26,7 +27,9 @@ function formatTime(dateStr) {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-export default function CommentSection({ taskId, users, currentUser }) {
+export default function CommentSection({ taskId, users, currentUser: currentUserProp }) {
+  const { authFetch, currentUser: authCurrentUser } = useAuth();
+  const currentUser = currentUserProp || authCurrentUser;
   const [comments, setComments] = useState([]);
   const [text, setText] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -34,7 +37,7 @@ export default function CommentSection({ taskId, users, currentUser }) {
 
   useEffect(() => {
     if (!taskId) return;
-    fetch(`/api/tasks/${taskId}/comments`)
+    authFetch(`/api/tasks/${taskId}/comments`)
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -51,9 +54,8 @@ export default function CommentSection({ taskId, users, currentUser }) {
     e.preventDefault();
     if (!text.trim() || submitting) return;
     setSubmitting(true);
-    const res = await fetch(`/api/tasks/${taskId}/comments`, {
+    const res = await authFetch(`/api/tasks/${taskId}/comments`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         user_id: currentUser?.id || null,
         author_name: currentUser?.name || 'Anonymous',
@@ -69,7 +71,7 @@ export default function CommentSection({ taskId, users, currentUser }) {
   };
 
   const deleteComment = async (id) => {
-    const res = await fetch(`/api/comments/${id}`, { method: 'DELETE' });
+    const res = await authFetch(`/api/comments/${id}`, { method: 'DELETE' });
     if (res.ok) {
       setComments(prev => prev.filter(c => c.id !== id));
     } else {
