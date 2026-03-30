@@ -1,0 +1,38 @@
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: projectmanager
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: projectmanager
+      DB_USER: root
+      DB_PASSWORD: rootpass
+      FRONTEND_URL: http://localhost:3000
+      JWT_SECRET: dev-jwt-secret-at-least-32-chars-long-xxx
+      JWT_REFRESH_SECRET: dev-refresh-secret-at-least-32-chars-long-xxx
+    ports:
+      - "3001:3001"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

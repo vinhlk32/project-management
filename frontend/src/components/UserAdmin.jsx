@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useAuth } from '../context/AuthContext';
 
 const AVATAR_COLORS = [
   '#4a9eff', '#8b5cf6', '#ec4899', '#06b6d4',
@@ -108,12 +109,93 @@ function EditModal({ user, onSave, onClose }) {
   );
 }
 
+/* ── Set Password Modal ──────────────────────────────────────────────────── */
+function SetPasswordModal({ user, onClose, authFetch }) {
+  const [newPassword, setNewPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+    if (newPassword.length < 8) { setError('Password must be at least 8 characters'); return; }
+    if (!/[0-9]/.test(newPassword)) { setError('Password must contain at least one number'); return; }
+    if (!/[a-zA-Z]/.test(newPassword)) { setError('Password must contain at least one letter'); return; }
+    if (newPassword !== confirm) { setError('Passwords do not match'); return; }
+    setLoading(true);
+    try {
+      const res = await authFetch('/api/auth/set-password', {
+        method: 'POST',
+        body: JSON.stringify({ userId: user.id, newPassword }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error || 'Failed to set password');
+      } else {
+        setSuccess('Password updated successfully');
+        setNewPassword('');
+        setConfirm('');
+      }
+    } catch {
+      setError('Failed to set password');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ width: 400 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>Set Password — {user.name}</h3>
+          <button className="close-btn" onClick={onClose}>&times;</button>
+        </div>
+        <form onSubmit={submit}>
+          <div className="ua-field">
+            <label>New Password</label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={e => setNewPassword(e.target.value)}
+              placeholder="Min 8 chars, letter + number"
+              autoComplete="new-password"
+            />
+          </div>
+          <div className="ua-field">
+            <label>Confirm Password</label>
+            <input
+              type="password"
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
+              placeholder="Repeat password"
+              autoComplete="new-password"
+            />
+          </div>
+          {error && <div className="ua-error">{error}</div>}
+          {success && <div style={{ color: '#065f46', background: '#d1fae5', padding: '8px 12px', borderRadius: 6, fontSize: 13, marginBottom: 8 }}>{success}</div>}
+          <div className="modal-actions">
+            <button type="button" className="btn-secondary" onClick={onClose}>Close</button>
+            <button type="submit" className="btn-primary" disabled={loading}>
+              {loading ? 'Saving…' : 'Set Password'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main Component ──────────────────────────────────────────────────────── */
 export default function UserAdmin({ users, onAdd, onUpdate, onDelete }) {
+  const { authFetch } = useAuth();
   const [search,     setSearch]     = useState('');
   const [filterRole, setFilterRole] = useState('');
   const [editUser,   setEditUser]   = useState(null);
   const [confirmDel, setConfirmDel] = useState(null);
+  const [setPasswordUser, setSetPasswordUser] = useState(null);
 
   // Add form state
   const [newName,     setNewName]     = useState('');
@@ -273,12 +355,15 @@ export default function UserAdmin({ users, onAdd, onUpdate, onDelete }) {
                     <th>Member</th>
                     <th>Email</th>
                     <th>Role</th>
+                    <th>Status</th>
                     <th>Joined</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(u => (
+                  {filtered.map(u => {
+                    const isLocked = u.locked_until && new Date(u.locked_until) > new Date();
+                    return (
                     <tr key={u.id} className="ua-row">
                       <td>
                         <div className="ua-member-cell">
@@ -288,9 +373,41 @@ export default function UserAdmin({ users, onAdd, onUpdate, onDelete }) {
                       </td>
                       <td className="ua-email">{u.email || <span style={{ color: '#c0c9d6' }}>—</span>}</td>
                       <td><RoleBadge role={u.role} /></td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 12 }}>
+                            <input
+                              type="checkbox"
+                              checked={u.is_active !== 0}
+                              onChange={e => onUpdate(u.id, { is_active: e.target.checked ? 1 : 0 })}
+                              title="Toggle active status"
+                            />
+                            {u.is_active !== 0 ? 'Active' : 'Inactive'}
+                          </label>
+                          {isLocked && (
+                            <span title={`Locked until ${u.locked_until}`} style={{ cursor: 'default' }}>🔒</span>
+                          )}
+                          {isLocked && (
+                            <button
+                              className="btn-secondary"
+                              style={{ fontSize: 11, padding: '2px 8px' }}
+                              onClick={() => onUpdate(u.id, { locked_until: null, failed_attempts: 0 })}
+                              title="Unlock account"
+                            >
+                              Unlock
+                            </button>
+                          )}
+                        </div>
+                      </td>
                       <td className="ua-date">{formatDate(u.created_at)}</td>
                       <td>
                         <div className="ua-actions">
+                          <button
+                            className="ua-edit-btn"
+                            style={{ fontSize: 11, padding: '3px 8px' }}
+                            onClick={() => setSetPasswordUser(u)}
+                            title="Set password"
+                          >🔑</button>
                           <button
                             className="ua-edit-btn"
                             onClick={() => setEditUser(u)}
@@ -304,13 +421,22 @@ export default function UserAdmin({ users, onAdd, onUpdate, onDelete }) {
                         </div>
                       </td>
                     </tr>
-                  ))}
+                  );})}
                 </tbody>
               </table>
             </div>
           )}
         </div>
       </div>
+
+      {/* ── Set Password Modal ── */}
+      {setPasswordUser && (
+        <SetPasswordModal
+          user={setPasswordUser}
+          onClose={() => setSetPasswordUser(null)}
+          authFetch={authFetch}
+        />
+      )}
 
       {/* ── Edit Modal ── */}
       {editUser && (

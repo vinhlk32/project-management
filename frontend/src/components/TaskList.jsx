@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import TaskModal from './TaskModal';
 import GanttChart from './GanttChart';
+import { useAuth } from '../context/AuthContext';
 
 const STATUS_LABELS = { todo: 'Todo', 'in-progress': 'In Progress', done: 'Done' };
 const STATUS_ORDER  = ['todo', 'in-progress', 'done'];
@@ -39,7 +40,9 @@ function Avatar({ name, color, size = 22 }) {
   );
 }
 
-export default function TaskList({ project, users = [], currentUser }) {
+export default function TaskList({ project, users = [], currentUser: currentUserProp }) {
+  const { authFetch, currentUser: authCurrentUser } = useAuth();
+  const currentUser = currentUserProp || authCurrentUser;
   const [tasks,        setTasks]        = useState([]);
   const [view,         setView]         = useState('kanban');
   const [modalOpen,    setModalOpen]    = useState(false);
@@ -50,7 +53,7 @@ export default function TaskList({ project, users = [], currentUser }) {
   const [filterPriority, setFilterPriority] = useState('');
 
   useEffect(() => {
-    fetch(`/api/projects/${project.id}/tasks`)
+    authFetch(`/api/projects/${project.id}/tasks`)
       .then(r => r.ok ? r.json() : [])
       .then(setTasks)
       .catch(err => console.error('Failed to load tasks:', err));
@@ -63,9 +66,8 @@ export default function TaskList({ project, users = [], currentUser }) {
 
   const saveTask = async (data) => {
     if (editingTask) {
-      const res = await fetch(`/api/tasks/${editingTask.id}`, {
+      const res = await authFetch(`/api/tasks/${editingTask.id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
       if (!res.ok) { console.error('Failed to update task'); closeModal(); return; }
@@ -73,9 +75,8 @@ export default function TaskList({ project, users = [], currentUser }) {
       setTasks(prev => prev.map(t => t.id === updated.id ? updated : t));
       applyAffected(affected);
     } else {
-      const res = await fetch('/api/tasks', {
+      const res = await authFetch('/api/tasks', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...data, project_id: project.id }),
       });
       if (!res.ok) { console.error('Failed to create task'); closeModal(); return; }
@@ -88,7 +89,7 @@ export default function TaskList({ project, users = [], currentUser }) {
   saveTask.__affectedUpdate = applyAffected;
 
   const deleteTask = async (id) => {
-    const res = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+    const res = await authFetch(`/api/tasks/${id}`, { method: 'DELETE' });
     if (res.ok) setTasks(prev => prev.filter(t => t.id !== id));
     else console.error('Failed to delete task');
   };
