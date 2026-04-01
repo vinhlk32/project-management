@@ -36,12 +36,24 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      - name: Build frontend
+      - name: Build frontend (staging)
+        if: github.ref == 'refs/heads/dev'
         run: npm run build
         working-directory: frontend
         env:
-          # main → PROD API URL, dev → STAGING API URL
-          VITE_API_URL: ${{ github.ref == 'refs/heads/main' && secrets.VITE_API_URL_PROD || secrets.VITE_API_URL_STAGING }}
+          VITE_API_URL: ${{ secrets.VITE_API_URL_STAGING }}
+
+      - name: Build frontend (production)
+        if: github.ref == 'refs/heads/main'
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL_PROD }}
+
+      - name: Build frontend (PR — no env, local proxy)
+        if: github.event_name == 'pull_request'
+        run: npm run build
+        working-directory: frontend
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -50,19 +62,19 @@ jobs:
           path: frontend/dist/
           retention-days: 1
 
-  # ── Job 2: Deploy Frontend → S3 + CloudFront ────────────────────────────────
-  deploy-frontend:
-    name: Deploy Frontend (${{ github.ref == 'refs/heads/main' && 'PROD' || 'STAGING' }})
+  # ── Job 2a: Deploy Frontend → STAGING (dev branch) ──────────────────────────
+  deploy-frontend-staging:
+    name: Deploy Frontend (STAGING)
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push'
-    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    environment: staging
 
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: frontend-dist-${{ github.ref_name }}
+          name: frontend-dist-dev
           path: dist/
 
       - name: Configure AWS credentials
@@ -72,46 +84,89 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            us-east-1
 
-      - name: Sync to S3
+      - name: Sync to S3 (staging)
+        env:
+          BUCKET: ${{ secrets.S3_BUCKET_STAGING }}
         run: |
-          BUCKET=${{ github.ref == 'refs/heads/main' && secrets.S3_BUCKET_PROD || secrets.S3_BUCKET_STAGING }}
           aws s3 sync dist/ s3://$BUCKET/ \
             --delete \
             --cache-control "public,max-age=31536000,immutable" \
             --exclude "index.html"
-          # index.html must not be cached (SPA routing)
           aws s3 cp dist/index.html s3://$BUCKET/index.html \
             --cache-control "no-cache,no-store,must-revalidate"
 
-      - name: Invalidate CloudFront cache
+      - name: Invalidate CloudFront (staging)
+        env:
+          DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID_STAGING }}
         run: |
-          DIST_ID=${{ github.ref == 'refs/heads/main' && secrets.CF_DISTRIBUTION_ID_PROD || secrets.CF_DISTRIBUTION_ID_STAGING }}
           aws cloudfront create-invalidation \
             --distribution-id $DIST_ID \
             --paths "/*"
 
-  # ── Job 3: Deploy Backend → EC2 via SSH ─────────────────────────────────────
-  deploy-backend:
-    name: Deploy Backend (${{ github.ref == 'refs/heads/main' && 'PROD' || 'STAGING' }})
+  # ── Job 2b: Deploy Frontend → PRODUCTION (main branch) ──────────────────────
+  deploy-frontend-prod:
+    name: Deploy Frontend (PRODUCTION)
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push'
-    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
 
     steps:
-      - name: Deploy to EC2
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-main
+          path: dist/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            us-east-1
+
+      - name: Sync to S3 (production)
+        env:
+          BUCKET: ${{ secrets.S3_BUCKET_PROD }}
+        run: |
+          aws s3 sync dist/ s3://$BUCKET/ \
+            --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "index.html"
+          aws s3 cp dist/index.html s3://$BUCKET/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      - name: Invalidate CloudFront (production)
+        env:
+          DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID_PROD }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id $DIST_ID \
+            --paths "/*"
+
+  # ── Job 3a: Deploy Backend → STAGING EC2 (dev branch) ───────────────────────
+  deploy-backend-staging:
+    name: Deploy Backend (STAGING)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    environment: staging
+
+    steps:
+      - name: Deploy to staging EC2
         uses: appleboy/ssh-action@v1
         with:
-          host:     ${{ github.ref == 'refs/heads/main' && secrets.EC2_HOST_PROD || secrets.EC2_HOST_STAGING }}
+          host:     ${{ secrets.EC2_HOST_STAGING }}
           username: ec2-user
-          key:      ${{ github.ref == 'refs/heads/main' && secrets.EC2_SSH_KEY_PROD || secrets.EC2_SSH_KEY_STAGING }}
+          key:      ${{ secrets.EC2_SSH_KEY_STAGING }}
           timeout:  120s
+          envs:     DEPLOY_BRANCH
           script: |
             set -e
             cd /opt/pmapp
 
-            echo "▶ Pulling latest code (${{ github.ref_name }})..."
-            git pull origin ${{ github.ref_name }}
+            echo "▶ Pulling latest code (dev → staging)..."
+            git pull origin dev
 
             echo "▶ Rebuilding and restarting backend..."
             docker compose -f docker-compose.prod.yml up -d --build backend
@@ -120,12 +175,52 @@ jobs:
             for i in $(seq 1 12); do
               STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/health)
               if [ "$STATUS" = "200" ]; then
-                echo "✅ Backend healthy (attempt $i)"
+                echo "✅ Staging backend healthy (attempt $i)"
                 exit 0
               fi
               echo "  Attempt $i: status=$STATUS, retrying..."
               sleep 5
             done
-            echo "❌ Backend health check failed after 60s"
+            echo "❌ Health check failed after 60s"
+            docker compose -f docker-compose.prod.yml logs --tail=50 backend
+            exit 1
+
+  # ── Job 3b: Deploy Backend → PRODUCTION EC2 (main branch) ───────────────────
+  deploy-backend-prod:
+    name: Deploy Backend (PRODUCTION)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Deploy to production EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.EC2_HOST_PROD }}
+          username: ec2-user
+          key:      ${{ secrets.EC2_SSH_KEY_PROD }}
+          timeout:  120s
+          script: |
+            set -e
+            cd /opt/pmapp
+
+            echo "▶ Pulling latest code (main → production)..."
+            git pull origin main
+
+            echo "▶ Rebuilding and restarting backend..."
+            docker compose -f docker-compose.prod.yml up -d --build backend
+
+            echo "▶ Waiting for health check..."
+            for i in $(seq 1 12); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/health)
+              if [ "$STATUS" = "200" ]; then
+                echo "✅ Production backend healthy (attempt $i)"
+                exit 0
+              fi
+              echo "  Attempt $i: status=$STATUS, retrying..."
+              sleep 5
+            done
+            echo "❌ Health check failed after 60s"
             docker compose -f docker-compose.prod.yml logs --tail=50 backend
             exit 1
