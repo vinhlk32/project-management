@@ -261,22 +261,76 @@ That's all — no systemd unit needed for the app.
 
 ---
 
-## Phase 3 — Code Change Required
+## Phase 3 — Code Change ✅ Done
 
-Frontend API calls must use the `VITE_API_URL` env var (baked in at build time).
-
-Find any hardcoded `localhost:3001` or `/api` references in `frontend/src/` and ensure they use:
-
+`frontend/src/context/AuthContext.jsx` now reads:
 ```javascript
 const API_BASE = import.meta.env.VITE_API_URL || '';
-// Usage: fetch(`${API_BASE}/api/users`)
 ```
-
-The `|| ''` fallback keeps local dev working via the Vite proxy without changes.
+All `fetch('/api/...')` calls use `` `${API_BASE}/api/...` ``.
+The `|| ''` fallback keeps local dev working via the Vite dev-proxy unchanged.
 
 ---
 
-## Phase 4 — First Frontend Deploy
+## Phase 4 — CI/CD (GitHub Actions)
+
+The pipeline lives in `.github/workflows/deploy.yml` and triggers on every push to `dev`.
+
+### Jobs
+
+| Job | Trigger | What it does |
+|---|---|---|
+| **Lint & Build** | all pushes + PRs | `npm ci` → `npm run build` (with `VITE_API_URL`) → uploads `dist/` artifact |
+| **Deploy Frontend** | push to `dev` only | Downloads artifact → `aws s3 sync` → CloudFront invalidation |
+| **Deploy Backend** | push to `dev` only | SSH into EC2 → `git pull` → `docker compose up -d --build` → health check |
+
+### GitHub Secrets to configure
+
+Go to **GitHub → repo → Settings → Secrets and variables → Actions** and add:
+
+| Secret | Value |
+|---|---|
+| `VITE_API_URL` | `https://dYYYYYY.cloudfront.net` (CloudFront #2) |
+| `AWS_ACCESS_KEY_ID` | IAM user `pmapp-deploy` access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM user `pmapp-deploy` secret key |
+| `S3_BUCKET` | `pmapp-frontend-<account-id>` |
+| `CF_FRONTEND_DISTRIBUTION_ID` | CloudFront #1 distribution ID |
+| `EC2_HOST` | Your Elastic IP address |
+| `EC2_SSH_KEY` | Full content of `pmapp-key.pem` |
+
+### IAM policy for `pmapp-deploy`
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::pmapp-frontend-<account-id>",
+        "arn:aws:s3:::pmapp-frontend-<account-id>/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": "arn:aws:cloudfront::<account-id>:distribution/<cf1-distribution-id>"
+    }
+  ]
+}
+```
+
+### Pipeline behaviour
+
+- **PRs** → only runs Build job (no deploy); blocks merge if build fails
+- **Push to dev** → Build → Deploy Frontend + Deploy Backend (parallel)
+- **Concurrent pushes** → new push cancels in-progress deployment
+- **Backend health check** → 12 × 5s retries; prints logs and fails the job if unreachable
+
+---
+
+## Phase 5 — First Frontend Deploy
 
 ```bash
 # From local machine, inside frontend/
@@ -290,7 +344,7 @@ Open `https://dXXXXXX.cloudfront.net` — app should load and login should work.
 
 ---
 
-## Ongoing Manual Deploy Commands
+## Ongoing Manual Deploy Commands (fallback without CI/CD)
 
 ### Deploy new backend version
 ```bash
