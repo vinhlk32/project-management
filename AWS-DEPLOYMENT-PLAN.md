@@ -182,12 +182,18 @@ sudo dnf install -y git
 
 Create `/etc/nginx/conf.d/pmapp.conf`:
 ```nginx
+# upstream block allows zero-downtime port swap via `nginx -s reload`
+# CI/CD uses `sed` to update the port, then reloads — no dropped connections
+upstream pmapp_backend {
+    server 127.0.0.1:3001;
+}
+
 server {
     listen 80;
     server_name _;
 
     location /api/ {
-        proxy_pass http://127.0.0.1:3001;
+        proxy_pass http://pmapp_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -233,26 +239,61 @@ JWT_SECRET=<node -e "console.log(require('crypto').randomBytes(64).toString('hex
 JWT_REFRESH_SECRET=<same command, different value>
 ```
 
-### 2.4 Start the App
+### 2.4 One-time Blue-Green Prerequisites
+
+The CI/CD pipeline runs containers directly (not via docker compose) and needs to reload Nginx without a password. Run these once on EC2:
+
+```bash
+# Create a dedicated Docker network shared by DB and backend containers
+docker network create pmapp-network
+
+# Allow ec2-user to reload Nginx without sudo password (CI/CD needs this)
+echo "ec2-user ALL=(ALL) NOPASSWD: /usr/sbin/nginx" \
+  | sudo tee /etc/sudoers.d/nginx-reload
+sudo chmod 440 /etc/sudoers.d/nginx-reload
+```
+
+### 2.5 Start the App
+
+Blue-green manages backend containers directly (not via docker compose), so start MySQL and the initial backend (blue slot) manually the first time:
 
 ```bash
 cd /opt/pmapp
-docker compose -f docker-compose.prod.yml up -d --build
 
-# Monitor startup
-docker compose -f docker-compose.prod.yml logs -f
+# Start MySQL
+docker run -d \
+  --name pmapp-db \
+  --network pmapp-network \
+  -e MYSQL_ROOT_PASSWORD=$(grep DB_PASSWORD .env.production | cut -d= -f2) \
+  -e MYSQL_DATABASE=projectmanager \
+  -e MYSQL_USER=$(grep DB_USER .env.production | cut -d= -f2) \
+  -e MYSQL_PASSWORD=$(grep DB_PASSWORD .env.production | cut -d= -f2) \
+  -v mysql_data:/var/lib/mysql \
+  --restart unless-stopped \
+  mysql:8.0
+
+# Wait ~30s for MySQL, then start backend on blue slot (:3001)
+docker build -t pmapp-backend:current ./backend
+docker run -d \
+  --name pmapp-backend-blue \
+  --network pmapp-network \
+  --env-file .env.production \
+  -e DB_HOST=pmapp-db \
+  -e PORT=3001 \
+  -p 127.0.0.1:3001:3001 \
+  --restart unless-stopped \
+  pmapp-backend:current
 
 # Verify
 curl http://localhost:3001/api/health   # should return 200
 
 # Seed admin user (first time only)
-docker compose -f docker-compose.prod.yml exec backend node seed-admin.js
+docker exec pmapp-backend-blue node seed-admin.js
 ```
 
-### 2.5 Auto-restart on EC2 Reboot
+### 2.6 Auto-restart on EC2 Reboot
 
-Docker containers already have `restart: unless-stopped` in `docker-compose.prod.yml`.
-Enable Docker to start on boot:
+All containers have `--restart unless-stopped`. Enable Docker on boot:
 ```bash
 sudo systemctl enable docker
 ```
