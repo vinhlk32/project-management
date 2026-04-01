@@ -112,6 +112,16 @@ async function initializeDatabase() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
+    // Migration: add parent_id column for subtask support
+    const [parentIdCheck] = await conn.execute(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tasks' AND COLUMN_NAME = 'parent_id'"
+    );
+    if (!parentIdCheck.length) {
+      await conn.execute('ALTER TABLE tasks ADD COLUMN parent_id INT DEFAULT NULL');
+      await conn.execute('ALTER TABLE tasks ADD INDEX idx_tasks_parent_id (parent_id)');
+      await conn.execute('ALTER TABLE tasks ADD CONSTRAINT fk_tasks_parent FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE');
+    }
+
     // task_dependencies
     await conn.execute(`
       CREATE TABLE IF NOT EXISTS task_dependencies (

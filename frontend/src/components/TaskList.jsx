@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import TaskModal from './TaskModal';
 import GanttChart from './GanttChart';
+import ConflictAlert from './ConflictAlert';
 import { useAuth } from '../context/AuthContext';
 
 const STATUS_LABELS = { todo: 'Todo', 'in-progress': 'In Progress', done: 'Done' };
@@ -43,20 +44,30 @@ function Avatar({ name, color, size = 22 }) {
 export default function TaskList({ project, users = [], currentUser: currentUserProp }) {
   const { authFetch, currentUser: authCurrentUser } = useAuth();
   const currentUser = currentUserProp || authCurrentUser;
-  const [tasks,        setTasks]        = useState([]);
-  const [view,         setView]         = useState('kanban');
-  const [modalOpen,    setModalOpen]    = useState(false);
-  const [editingTask,  setEditingTask]  = useState(null);
-  const [ganttRefresh, setGanttRefresh] = useState(0);
-  const [search,       setSearch]       = useState('');
+  const [tasks,          setTasks]          = useState([]);
+  const [view,           setView]           = useState('kanban');
+  const [modalOpen,      setModalOpen]      = useState(false);
+  const [editingTask,    setEditingTask]    = useState(null);
+  const [ganttRefresh,   setGanttRefresh]   = useState(0);
+  const [search,         setSearch]         = useState('');
   const [filterAssignee, setFilterAssignee] = useState('');
   const [filterPriority, setFilterPriority] = useState('');
+  const [conflicts,      setConflicts]      = useState([]);
+  const [conflictsOpen,  setConflictsOpen]  = useState(false);
+
+  const loadConflicts = useCallback(() => {
+    authFetch(`/api/projects/${project.id}/conflicts`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setConflicts)
+      .catch(() => {});
+  }, [project.id]);
 
   useEffect(() => {
     authFetch(`/api/projects/${project.id}/tasks`)
       .then(r => r.ok ? r.json() : [])
       .then(setTasks)
       .catch(err => console.error('Failed to load tasks:', err));
+    loadConflicts();
   }, [project.id]);
 
   const applyAffected = (affected) => {
@@ -84,6 +95,37 @@ export default function TaskList({ project, users = [], currentUser: currentUser
       setTasks(prev => [created, ...prev]);
     }
     closeModal();
+    loadConflicts();
+  };
+
+  const handleSubtaskCreated = (newTask) => {
+    setTasks(prev => [...prev, newTask]);
+  };
+
+  const handleGanttDateChange = async (taskId, field, value) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const res = await authFetch(`/api/tasks/${taskId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        title:           task.title,
+        description:     task.description || '',
+        status:          task.status,
+        priority:        task.priority,
+        assignee_id:     task.assignee_id || null,
+        labels:          task.labels || '',
+        start_date:      task.start_date || null,
+        due_date:        task.due_date || null,
+        estimated_hours: task.estimated_hours || 0,
+        logged_hours:    task.logged_hours || 0,
+        [field]:         value || null,
+      }),
+    });
+    if (!res.ok) return;
+    const { task: updated, affected } = await res.json();
+    setTasks(prev => prev.map(t => t.id === updated.id ? updated : t));
+    applyAffected(affected);
+    loadConflicts();
   };
 
   saveTask.__affectedUpdate = applyAffected;
@@ -96,14 +138,29 @@ export default function TaskList({ project, users = [], currentUser: currentUser
 
   const openEdit  = (task) => { setEditingTask(task); setModalOpen(true); };
   const openNew   = ()     => { setEditingTask(null);  setModalOpen(true); };
+  const goToTask  = (taskId) => {
+    const t = tasks.find(t => t.id === taskId);
+    if (t) openEdit(t);
+  };
   const closeModal = ()    => {
     setModalOpen(false);
     setEditingTask(null);
     setGanttRefresh(n => n + 1);
   };
 
-  // Apply filters
+  // Subtask counts per parent task
+  const subtaskCounts = tasks.reduce((acc, t) => {
+    if (t.parent_id) acc[t.parent_id] = (acc[t.parent_id] || 0) + 1;
+    return acc;
+  }, {});
+  const subtaskDoneCounts = tasks.reduce((acc, t) => {
+    if (t.parent_id && t.status === 'done') acc[t.parent_id] = (acc[t.parent_id] || 0) + 1;
+    return acc;
+  }, {});
+
+  // Apply filters — only top-level tasks in kanban/gantt
   const filtered = tasks.filter(t => {
+    if (t.parent_id) return false; // subtasks shown inside parent modal only
     if (search && !t.title.toLowerCase().includes(search.toLowerCase()) &&
         !t.description?.toLowerCase().includes(search.toLowerCase())) return false;
     if (filterAssignee && String(t.assignee_id) !== filterAssignee) return false;
@@ -123,6 +180,16 @@ export default function TaskList({ project, users = [], currentUser: currentUser
       <div className="task-header">
         <h2>{project.name}</h2>
         <div className="task-header-right">
+          {conflicts.length > 0 && (
+            <button
+              className="conflict-badge-btn"
+              onClick={() => setConflictsOpen(true)}
+              title="View scheduling conflicts"
+            >
+              <span className="conflict-badge-icon">⚠</span>
+              {conflicts.length} conflict{conflicts.length !== 1 ? 's' : ''}
+            </button>
+          )}
           <div className="view-toggle">
             <button className={`view-btn${view === 'kanban' ? ' active' : ''}`} onClick={() => setView('kanban')}>
               Kanban
@@ -184,7 +251,7 @@ export default function TaskList({ project, users = [], currentUser: currentUser
         )}
 
         <span className="filter-count">
-          {filtered.length} / {tasks.length} tasks
+          {filtered.length} / {tasks.filter(t => !t.parent_id).length} tasks
         </span>
       </div>
 
@@ -265,6 +332,14 @@ export default function TaskList({ project, users = [], currentUser: currentUser
                         />
                       </div>
                     )}
+
+                    {/* Subtask count badge */}
+                    {subtaskCounts[task.id] > 0 && (
+                      <div className="subtask-badge" title="Subtasks">
+                        <span className="subtask-badge-icon">⊞</span>
+                        <span>{subtaskDoneCounts[task.id] || 0}/{subtaskCounts[task.id]}</span>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -276,20 +351,32 @@ export default function TaskList({ project, users = [], currentUser: currentUser
       {view === 'gantt' && (
         <GanttChart
           project={project}
-          tasks={tasks}
+          tasks={tasks.filter(t => !t.parent_id)}
           onEditTask={openEdit}
+          onDateChange={handleGanttDateChange}
           refreshKey={ganttRefresh}
         />
       )}
 
       {modalOpen && (
         <TaskModal
+          key={editingTask?.id ?? 'new'}
           task={editingTask}
           projectTasks={tasks}
           users={users}
           currentUser={currentUser}
           onSave={saveTask}
           onClose={closeModal}
+          onEditTask={(subtask) => setEditingTask(subtask)}
+          onSubtaskCreated={handleSubtaskCreated}
+        />
+      )}
+
+      {conflictsOpen && conflicts.length > 0 && (
+        <ConflictAlert
+          conflicts={conflicts}
+          onClose={() => setConflictsOpen(false)}
+          onGoToTask={goToTask}
         />
       )}
     </div>
