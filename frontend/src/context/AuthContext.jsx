@@ -1,5 +1,7 @@
 import { createContext, useContext, useState, useCallback, useRef } from 'react';
 
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
@@ -8,7 +10,7 @@ export function AuthProvider({ children }) {
   const csrfTokenRef = useRef(null);
 
   const login = useCallback(async (email, password) => {
-    const res = await fetch('/api/auth/login', {
+    const res = await fetch(`${API_BASE}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -27,7 +29,7 @@ export function AuthProvider({ children }) {
 
   const logout = useCallback(async () => {
     try {
-      await fetch('/api/auth/logout', {
+      await fetch(`${API_BASE}/api/auth/logout`, {
         method: 'POST',
         headers: { 'X-CSRF-Token': csrfTokenRef.current, 'Authorization': `Bearer ${accessToken}` },
         credentials: 'include'
@@ -40,7 +42,7 @@ export function AuthProvider({ children }) {
   }, [accessToken]);
 
   const refresh = useCallback(async () => {
-    const res = await fetch('/api/auth/refresh', {
+    const res = await fetch(`${API_BASE}/api/auth/refresh`, {
       method: 'POST',
       credentials: 'include'
     });
@@ -52,7 +54,7 @@ export function AuthProvider({ children }) {
   }, []);
 
   const authFetch = useCallback(async (url, options = {}) => {
-    const doFetch = (token) => fetch(url, {
+    const doFetch = (token) => fetch(`${API_BASE}${url}`, {
       ...options,
       credentials: 'include',
       headers: {

@@ -27,7 +27,6 @@ const LABEL_PRESETS = [
 function labelColor(name) {
   const preset = LABEL_PRESETS.find(l => l.name.toLowerCase() === name.toLowerCase());
   if (preset) return preset.color;
-  // Generate a stable color from the label name
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
   const colors = ['#4a9eff', '#8b5cf6', '#ec4899', '#06b6d4', '#22c55e', '#f97316', '#f59e0b'];
@@ -47,7 +46,18 @@ function Avatar({ name, color, size = 26 }) {
   );
 }
 
-export default function TaskModal({ task, projectTasks, users = [], currentUser: currentUserProp, onSave, onClose }) {
+const STATUS_COLORS = { todo: '#6b7280', 'in-progress': '#f59e0b', done: '#22c55e' };
+
+export default function TaskModal({
+  task,
+  projectTasks,
+  users = [],
+  currentUser: currentUserProp,
+  onSave,
+  onClose,
+  onEditTask,
+  onSubtaskCreated,
+}) {
   const { authFetch, currentUser: authCurrentUser } = useAuth();
   const currentUser = currentUserProp || authCurrentUser;
   const [activeTab, setActiveTab] = useState('details');
@@ -63,9 +73,19 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
   const [estimatedHours, setEstimatedHours] = useState(task?.estimated_hours || '');
   const [loggedHours, setLoggedHours] = useState(task?.logged_hours || '');
 
+  // Dependencies for existing task (fetched from API)
   const [deps, setDeps] = useState([]);
   const [newDep, setNewDep] = useState({ predecessor_id: '', type: 'FS', lag: 0 });
   const [depError, setDepError] = useState('');
+
+  // Pending dependencies for new task creation (local only, sent on save)
+  const [pendingDeps, setPendingDeps] = useState([]);
+  const [pendingDep, setPendingDep] = useState({ predecessor_id: '', type: 'FS', lag: 0 });
+
+  // Subtasks
+  const [subtasks, setSubtasks] = useState([]);
+  const [subtaskTitle, setSubtaskTitle] = useState('');
+  const [subtaskSaving, setSubtaskSaving] = useState(false);
 
   const isEditing = !!task;
 
@@ -74,6 +94,13 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
     authFetch(`/api/tasks/${task.id}/dependencies`)
       .then(r => r.json())
       .then(setDeps);
+  }, [task?.id]);
+
+  useEffect(() => {
+    if (!task?.id) return;
+    authFetch(`/api/tasks/${task.id}/subtasks`)
+      .then(r => r.json())
+      .then(setSubtasks);
   }, [task?.id]);
 
   const handleSubmit = (e) => {
@@ -90,6 +117,10 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
       due_date: dueDate || null,
       estimated_hours: estimatedHours ? Number(estimatedHours) : 0,
       logged_hours: loggedHours ? Number(loggedHours) : 0,
+      // Only include dependencies on create
+      ...(!isEditing && pendingDeps.length > 0 && {
+        dependencies: pendingDeps.map(({ predecessor_id, type, lag }) => ({ predecessor_id, type, lag })),
+      }),
     });
   };
 
@@ -102,6 +133,7 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
 
   const removeLabel = (name) => setLabels(prev => prev.filter(l => l !== name));
 
+  // ── Existing-task dependency management ───────────────────────────────────
   const addDependency = async () => {
     setDepError('');
     if (!newDep.predecessor_id) return;
@@ -135,9 +167,60 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
     setDeps(prev => prev.filter(d => d.id !== depId));
   };
 
+  // ── Pending dependency management (create mode) ────────────────────────────
+  const addPendingDep = () => {
+    if (!pendingDep.predecessor_id) return;
+    const predId = Number(pendingDep.predecessor_id);
+    if (pendingDeps.some(d => d.predecessor_id === predId)) return;
+    const predTask = (projectTasks || []).find(t => t.id === predId);
+    setPendingDeps(prev => [...prev, {
+      predecessor_id: predId,
+      type: pendingDep.type,
+      lag: Number(pendingDep.lag) || 0,
+      predecessor_title: predTask?.title || String(predId),
+    }]);
+    setPendingDep({ predecessor_id: '', type: 'FS', lag: 0 });
+  };
+
+  const removePendingDep = (predId) => {
+    setPendingDeps(prev => prev.filter(d => d.predecessor_id !== predId));
+  };
+
+  // ── Subtask creation ───────────────────────────────────────────────────────
+  const createSubtask = async () => {
+    if (!subtaskTitle.trim() || !task?.id) return;
+    setSubtaskSaving(true);
+    const res = await authFetch('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: task.project_id,
+        title: subtaskTitle.trim(),
+        status: 'todo',
+        priority: 'medium',
+        parent_id: task.id,
+      }),
+    });
+    setSubtaskSaving(false);
+    if (!res.ok) return;
+    const newSubtask = await res.json();
+    setSubtasks(prev => [...prev, newSubtask]);
+    setSubtaskTitle('');
+    onSubtaskCreated?.(newSubtask);
+  };
+
+  const deleteSubtask = async (subtaskId) => {
+    const res = await authFetch(`/api/tasks/${subtaskId}`, { method: 'DELETE' });
+    if (res.ok) setSubtasks(prev => prev.filter(s => s.id !== subtaskId));
+  };
+
   const existingPredIds = new Set(deps.map(d => d.predecessor_id));
-  const eligible = (projectTasks || []).filter(
+  const pendingPredIds = new Set(pendingDeps.map(d => d.predecessor_id));
+
+  const eligibleForEdit = (projectTasks || []).filter(
     t => t.id !== task?.id && !existingPredIds.has(t.id)
+  );
+  const eligibleForCreate = (projectTasks || []).filter(
+    t => !pendingPredIds.has(t.id)
   );
 
   const assignee = users.find(u => String(u.id) === assigneeId);
@@ -146,7 +229,11 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <h3>{isEditing ? 'Edit Task' : 'New Task'}</h3>
+          <h3>
+            {isEditing
+              ? (task.parent_id ? 'Edit Subtask' : 'Edit Task')
+              : 'New Task'}
+          </h3>
           <button className="close-btn" onClick={onClose}>&times;</button>
         </div>
 
@@ -156,6 +243,15 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
               className={`modal-tab${activeTab === 'details' ? ' active' : ''}`}
               onClick={() => setActiveTab('details')}
             >Details</button>
+            <button
+              className={`modal-tab${activeTab === 'subtasks' ? ' active' : ''}`}
+              onClick={() => setActiveTab('subtasks')}
+            >
+              Subtasks
+              {subtasks.length > 0 && (
+                <span className="tab-count">{subtasks.length}</span>
+              )}
+            </button>
             <button
               className={`modal-tab${activeTab === 'comments' ? ' active' : ''}`}
               onClick={() => setActiveTab('comments')}
@@ -297,6 +393,63 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
               )}
             </div>
 
+            {/* ── Dependencies section for new task creation ── */}
+            {!isEditing && (
+              <div className="create-deps-section">
+                <label>Dependencies <span className="label-hint">(optional — tasks this must wait for)</span></label>
+
+                {pendingDeps.length > 0 && (
+                  <ul className="deps-list">
+                    {pendingDeps.map(d => (
+                      <li key={d.predecessor_id} className="dep-item">
+                        <span className="dep-type-badge">{d.type}</span>
+                        <span className="dep-task-name">{d.predecessor_title}</span>
+                        {d.lag !== 0 && (
+                          <span className="dep-lag">{d.lag > 0 ? `+${d.lag}d` : `${d.lag}d`}</span>
+                        )}
+                        <button type="button" className="dep-remove" onClick={() => removePendingDep(d.predecessor_id)}>&times;</button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {eligibleForCreate.length > 0 && (
+                  <div className="dep-add-row">
+                    <select
+                      value={pendingDep.predecessor_id}
+                      onChange={e => setPendingDep(p => ({ ...p, predecessor_id: e.target.value }))}
+                    >
+                      <option value="">Select predecessor…</option>
+                      {eligibleForCreate.map(t => (
+                        <option key={t.id} value={t.id}>{t.title}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={pendingDep.type}
+                      onChange={e => setPendingDep(p => ({ ...p, type: e.target.value }))}
+                      className="dep-type-select"
+                    >
+                      {DEP_TYPES.map(t => (
+                        <option key={t} value={t}>{DEP_LABELS[t]}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      className="lag-input"
+                      value={pendingDep.lag}
+                      onChange={e => setPendingDep(p => ({ ...p, lag: e.target.value }))}
+                      title="Lag in days"
+                      placeholder="Lag"
+                    />
+                    <span className="lag-label">d lag</span>
+                    <button type="button" className="btn-secondary dep-add-btn" onClick={addPendingDep}>
+                      Add
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="modal-actions">
               <button type="button" className="btn-secondary" onClick={onClose}>Cancel</button>
               <button type="submit" className="btn-primary">
@@ -304,6 +457,76 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
               </button>
             </div>
           </form>
+        )}
+
+        {/* ── Subtasks Tab ───────────────────────────────────────────── */}
+        {activeTab === 'subtasks' && isEditing && (
+          <div className="deps-section deps-tab">
+            <div className="deps-title">Subtasks</div>
+
+            {subtasks.length > 0 ? (
+              <ul className="subtasks-list">
+                {subtasks.map(s => {
+                  const doneCount = subtasks.filter(x => x.status === 'done').length;
+                  return (
+                    <li key={s.id} className="subtask-item" onClick={() => onEditTask?.(s)}>
+                      <span
+                        className="subtask-status-dot"
+                        style={{ background: STATUS_COLORS[s.status] || '#6b7280' }}
+                        title={s.status}
+                      />
+                      <span className={`subtask-title${s.status === 'done' ? ' subtask-done' : ''}`}>
+                        {s.title}
+                      </span>
+                      {s.assignee_name && (
+                        <Avatar name={s.assignee_name} color={s.assignee_color} size={20} />
+                      )}
+                      <button
+                        className="dep-remove"
+                        onClick={e => { e.stopPropagation(); deleteSubtask(s.id); }}
+                        title="Delete subtask"
+                      >&times;</button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="card-empty">No subtasks yet.</div>
+            )}
+
+            {subtasks.length > 0 && (
+              <div className="subtask-progress">
+                <div className="subtask-progress-bar">
+                  <div
+                    className="subtask-progress-fill"
+                    style={{ width: `${Math.round((subtasks.filter(s => s.status === 'done').length / subtasks.length) * 100)}%` }}
+                  />
+                </div>
+                <span className="subtask-progress-label">
+                  {subtasks.filter(s => s.status === 'done').length} / {subtasks.length} done
+                </span>
+              </div>
+            )}
+
+            <div className="dep-add-row" style={{ marginTop: 14 }}>
+              <input
+                type="text"
+                placeholder="New subtask title…"
+                value={subtaskTitle}
+                onChange={e => setSubtaskTitle(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); createSubtask(); } }}
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                className="btn-primary dep-add-btn"
+                onClick={createSubtask}
+                disabled={subtaskSaving || !subtaskTitle.trim()}
+              >
+                {subtaskSaving ? '…' : '+ Add'}
+              </button>
+            </div>
+          </div>
         )}
 
         {/* ── Comments Tab ───────────────────────────────────────────── */}
@@ -333,14 +556,14 @@ export default function TaskModal({ task, projectTasks, users = [], currentUser:
 
             {deps.length === 0 && <div className="card-empty">No dependencies yet.</div>}
 
-            {eligible.length > 0 && (
+            {eligibleForEdit.length > 0 && (
               <div className="dep-add-row" style={{ marginTop: 12 }}>
                 <select
                   value={newDep.predecessor_id}
                   onChange={e => setNewDep(p => ({ ...p, predecessor_id: e.target.value }))}
                 >
                   <option value="">Select task…</option>
-                  {eligible.map(t => (
+                  {eligibleForEdit.map(t => (
                     <option key={t.id} value={t.id}>{t.title}</option>
                   ))}
                 </select>

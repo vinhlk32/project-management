@@ -14,6 +14,9 @@ const { logAudit } = require('./audit');
 
 const app = express();
 
+// Trust proxy — required when behind CloudFront/Nginx (for rate limiting, IP detection)
+app.set('trust proxy', 1);
+
 // ── Security headers ───────────────────────────────────────────────────────────
 app.use(helmet());
 
@@ -315,7 +318,7 @@ app.get('/api/projects/:id/tasks', async (req, res) => {
 
 app.post('/api/tasks', async (req, res) => {
   try {
-    const { project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours } = req.body;
+    const { project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, parent_id, dependencies } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
     if (title.trim().length > 300) return res.status(400).json({ error: 'Title too long (max 300)' });
     if (description && description.length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
@@ -323,35 +326,57 @@ app.post('/api/tasks', async (req, res) => {
     if (status && !VALID_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
     if (priority && !VALID_PRIORITIES.includes(priority)) return res.status(400).json({ error: 'Invalid priority' });
     if (assignee_id && !isValidId(assignee_id)) return res.status(400).json({ error: 'Invalid assignee_id' });
+    if (parent_id && !isValidId(parent_id)) return res.status(400).json({ error: 'Invalid parent_id' });
     const hours = Number(estimated_hours) || 0;
     if (hours < 0 || hours > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
 
     const result = await db.execute({
-      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         project_id, title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
         assignee_id || null, (labels || '').slice(0, 500),
         start_date || null, due_date || null,
-        hours,
+        hours, parent_id || null,
       ],
     });
+
+    const taskId = Number(result.lastInsertRowid);
+
+    // Create initial dependencies if provided
+    if (Array.isArray(dependencies) && dependencies.length > 0) {
+      for (const dep of dependencies) {
+        const { predecessor_id, type, lag } = dep;
+        if (!isValidId(predecessor_id) || Number(predecessor_id) === taskId) continue;
+        const depType = VALID_DEP_TYPES.includes(type) ? type : 'FS';
+        const lagVal = Number.isInteger(Number(lag)) ? Math.max(-999, Math.min(999, Number(lag))) : 0;
+        try {
+          await db.execute({
+            sql: 'INSERT INTO task_dependencies (predecessor_id, successor_id, type, `lag`) VALUES (?, ?, ?, ?)',
+            args: [predecessor_id, taskId, depType, lagVal],
+          });
+        } catch (depErr) {
+          if (!depErr.message?.includes('UNIQUE')) throw depErr;
+        }
+      }
+    }
+
     const row = await db.execute({
       sql: `SELECT t.*, u.name AS assignee_name, u.avatar_color AS assignee_color
             FROM tasks t LEFT JOIN users u ON u.id = t.assignee_id
             WHERE t.id = ?`,
-      args: [result.lastInsertRowid],
+      args: [taskId],
     });
 
     await logAudit(db, {
       userId: req.user?.sub,
       action: 'task_created',
       entityType: 'task',
-      entityId: Number(result.lastInsertRowid),
+      entityId: taskId,
       ip: req.ip,
       userAgent: req.headers['user-agent'],
-      detail: { title: title.trim(), project_id },
+      detail: { title: title.trim(), project_id, parent_id: parent_id || null },
     });
 
     res.status(201).json(row.rows[0]);
@@ -422,6 +447,19 @@ app.delete('/api/tasks/:id', async (req, res) => {
     });
 
     res.status(204).end();
+  } catch (err) { handleError(res, err); }
+});
+
+app.get('/api/tasks/:id/subtasks', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT t.*, u.name AS assignee_name, u.avatar_color AS assignee_color
+            FROM tasks t LEFT JOIN users u ON u.id = t.assignee_id
+            WHERE t.parent_id = ?
+            ORDER BY t.created_at ASC`,
+      args: [req.params.id],
+    });
+    res.json(result.rows);
   } catch (err) { handleError(res, err); }
 });
 
@@ -528,7 +566,7 @@ app.post('/api/tasks/:id/dependencies', async (req, res) => {
     const affected = await propagateDates(db, Number(predecessor_id));
     res.status(201).json({ dependency: row.rows[0], affected: Object.values(affected) });
   } catch (err) {
-    if (err.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Dependency already exists' });
+    if (err.message?.includes('UNIQUE') || err.message?.includes('Duplicate entry')) return res.status(409).json({ error: 'Dependency already exists' });
     handleError(res, err);
   }
 });
@@ -583,6 +621,119 @@ app.get('/api/projects/:id/analytics', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── Conflict detection ────────────────────────────────────────────────────────
+
+app.get('/api/projects/:id/conflicts', async (req, res) => {
+  try {
+    const projectId = req.params.id;
+    const conflicts = [];
+
+    // 1. Assignee date overlap — two non-done tasks for the same person with overlapping ranges
+    const overlapResult = await db.execute({
+      sql: `SELECT
+              t1.id AS task1_id, t1.title AS task1_title,
+              t1.start_date AS t1_start, t1.due_date AS t1_due, t1.priority AS t1_priority,
+              t2.id AS task2_id, t2.title AS task2_title,
+              t2.start_date AS t2_start, t2.due_date AS t2_due, t2.priority AS t2_priority,
+              u.name AS assignee_name, u.avatar_color AS assignee_color
+            FROM tasks t1
+            JOIN tasks t2 ON t2.assignee_id = t1.assignee_id AND t2.id > t1.id
+            JOIN users u ON u.id = t1.assignee_id
+            WHERE t1.project_id = ?
+              AND t1.status != 'done' AND t2.status != 'done'
+              AND t1.parent_id IS NULL AND t2.parent_id IS NULL
+              AND t1.start_date IS NOT NULL AND t1.due_date IS NOT NULL
+              AND t2.start_date IS NOT NULL AND t2.due_date IS NOT NULL
+              AND t1.start_date <= t2.due_date AND t2.start_date <= t1.due_date`,
+      args: [projectId],
+    });
+
+    for (const r of overlapResult.rows) {
+      conflicts.push({
+        type: 'assignee_overlap',
+        severity: 'warning',
+        message: `${r.assignee_name} is double-booked: "${r.task1_title}" and "${r.task2_title}" overlap`,
+        task_ids: [r.task1_id, r.task2_id],
+        task_titles: [r.task1_title, r.task2_title],
+        assignee_name: r.assignee_name,
+        assignee_color: r.assignee_color,
+        meta: {
+          t1_start: r.t1_start, t1_due: r.t1_due,
+          t2_start: r.t2_start, t2_due: r.t2_due,
+        },
+      });
+    }
+
+    // 2. Dependency date violations — task dates contradict dependency constraints
+    const depResult = await db.execute({
+      sql: `SELECT
+              td.type, td.lag,
+              p.id AS pred_id, p.title AS pred_title,
+              p.start_date AS pred_start, p.due_date AS pred_due,
+              s.id AS succ_id, s.title AS succ_title,
+              s.start_date AS succ_start, s.due_date AS succ_due
+            FROM task_dependencies td
+            JOIN tasks p ON p.id = td.predecessor_id
+            JOIN tasks s ON s.id = td.successor_id
+            WHERE p.project_id = ?
+              AND p.status != 'done' AND s.status != 'done'`,
+      args: [projectId],
+    });
+
+    function addDays(dateStr, days) {
+      const d = new Date(dateStr + 'T00:00:00');
+      d.setDate(d.getDate() + days);
+      return d.toISOString().split('T')[0];
+    }
+
+    for (const d of depResult.rows) {
+      const lag = d.lag || 0;
+      let violated = false;
+      let hint = '';
+
+      if (d.type === 'FS' && d.pred_due && d.succ_start) {
+        const minStart = addDays(d.pred_due, lag);
+        if (d.succ_start < minStart) {
+          violated = true;
+          hint = `must start on or after ${minStart}`;
+        }
+      } else if (d.type === 'SS' && d.pred_start && d.succ_start) {
+        const minStart = addDays(d.pred_start, lag);
+        if (d.succ_start < minStart) {
+          violated = true;
+          hint = `must start on or after ${minStart}`;
+        }
+      } else if (d.type === 'FF' && d.pred_due && d.succ_due) {
+        const minDue = addDays(d.pred_due, lag);
+        if (d.succ_due < minDue) {
+          violated = true;
+          hint = `must finish on or after ${minDue}`;
+        }
+      } else if (d.type === 'SF' && d.pred_start && d.succ_due) {
+        const minDue = addDays(d.pred_start, lag);
+        if (d.succ_due < minDue) {
+          violated = true;
+          hint = `must finish on or after ${minDue}`;
+        }
+      }
+
+      if (violated) {
+        conflicts.push({
+          type: 'dependency_violation',
+          severity: 'error',
+          message: `Dependency violated: "${d.succ_title}" ${hint} (${d.type} from "${d.pred_title}")`,
+          task_ids: [d.pred_id, d.succ_id],
+          task_titles: [d.pred_title, d.succ_title],
+          dep_type: d.type,
+          hint,
+        });
+      }
+    }
+
+    res.json(conflicts);
+  } catch (err) { handleError(res, err); }
+});
+
 // ── Cycle detection ───────────────────────────────────────────────────────────
 
 async function wouldCreateCycle(db, startId, targetId) {
@@ -605,10 +756,23 @@ async function wouldCreateCycle(db, startId, targetId) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
-initializeDatabase().then(() => {
-  cleanupExpiredTokens();
-  app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
-}).catch(err => {
-  console.error('Failed to initialize database:', err);
-  process.exit(1);
-});
+
+async function startWithRetry(retries = 10, delayMs = 3000) {
+  for (let i = 1; i <= retries; i++) {
+    try {
+      await initializeDatabase();
+      cleanupExpiredTokens();
+      app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
+      return;
+    } catch (err) {
+      console.error(`DB not ready (attempt ${i}/${retries}): ${err.message}`);
+      if (i === retries) {
+        console.error('Failed to initialize database after all retries.');
+        process.exit(1);
+      }
+      await new Promise(res => setTimeout(res, delayMs));
+    }
+  }
+}
+
+startWithRetry();

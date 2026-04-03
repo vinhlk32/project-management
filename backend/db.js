@@ -14,9 +14,7 @@ function getPool() {
       connectionLimit:    10,
       queueLimit:         0,
       dateStrings:        true, // return DATE/DATETIME as strings, not JS Date objects
-      ssl: process.env.NODE_ENV === 'production'
-        ? { rejectUnauthorized: true }
-        : false,
+      ssl: false,
     });
   }
   return pool;
@@ -111,6 +109,16 @@ async function initializeDatabase() {
           REFERENCES users(id)    ON DELETE SET NULL
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    // Migration: add parent_id column for subtask support
+    const [parentIdCheck] = await conn.execute(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tasks' AND COLUMN_NAME = 'parent_id'"
+    );
+    if (!parentIdCheck.length) {
+      await conn.execute('ALTER TABLE tasks ADD COLUMN parent_id INT DEFAULT NULL');
+      await conn.execute('ALTER TABLE tasks ADD INDEX idx_tasks_parent_id (parent_id)');
+      await conn.execute('ALTER TABLE tasks ADD CONSTRAINT fk_tasks_parent FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE');
+    }
 
     // task_dependencies
     await conn.execute(`
