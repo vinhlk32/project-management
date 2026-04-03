@@ -14,9 +14,7 @@ function getPool() {
       connectionLimit:    10,
       queueLimit:         0,
       dateStrings:        true, // return DATE/DATETIME as strings, not JS Date objects
-      ssl: process.env.NODE_ENV === 'production'
-        ? { rejectUnauthorized: true }
-        : false,
+      ssl: false,
     });
   }
   return pool;
