@@ -14,6 +14,9 @@ const { logAudit } = require('./audit');
 
 const app = express();
 
+// Trust proxy — required when behind CloudFront/Nginx (for rate limiting, IP detection)
+app.set('trust proxy', 1);
+
 // ── Security headers ───────────────────────────────────────────────────────────
 app.use(helmet());
 
