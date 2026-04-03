@@ -1,7 +1,7 @@
 # AWS Deployment Plan — Project Management App
 
-> **Strategy:** Lowest cost, Docker on EC2 (parity with local dev), no custom domain, manual deployments.
-> **Estimated cost:** $0/month (free tier, first 12 months) → ~$9.60/month after
+> **Strategy:** Production only on AWS. Test everything locally, merge to `main` to deploy. Docker on EC2, CodeDeploy for zero-downtime backend deploys, no SSH in CI/CD pipeline.
+> **Estimated cost:** $0/month (free tier, first 12 months) → ~$9.87/month after
 
 ---
 
@@ -22,17 +22,20 @@ Same Docker image, same MySQL version, same networking — only env vars and por
 
 ```
 Browser
-  │
-  ├── HTTPS ──► CloudFront #1 ──► S3              (React frontend)
-  │
-  └── HTTPS ──► CloudFront #2 ──► EC2 :80
-                                   └── Nginx (reverse proxy)
-                                        └── backend container :3001
-                                             └── db container :3306 (internal only)
+  └── HTTPS ──► CloudFront #2 (prod frontend) ──► S3 prod
+  └── HTTPS ──► CloudFront #3 (prod backend)  ──► EC2 :80
+                                                   └── Nginx → :3001/:3002 (blue/green)
+                                                        └── pmapp-db-prod (internal)
+
+GitHub Actions (main push)
+  ├── frontend build → S3 → CloudFront invalidation
+  └── backend zip → S3 deploy bucket → CodeDeploy → EC2
 ```
 
-### Why Two CloudFront Distributions?
-Browsers block HTTPS pages from calling HTTP APIs (mixed-content). CloudFront #2 acts as an HTTPS proxy in front of EC2 — no custom domain or SSL cert needed.
+**Dev/staging = local only.** Test everything locally on `dev` branch, merge to `main` to deploy.
+
+### Why CloudFront for backend?
+Browsers block HTTPS pages from calling HTTP APIs (mixed-content). CloudFront #3 is an HTTPS proxy in front of EC2 — no custom domain or SSL cert needed.
 
 ---
 
@@ -42,13 +45,15 @@ Browsers block HTTPS pages from calling HTTP APIs (mixed-content). CloudFront #2
 |---|---|---|
 | EC2 t3.micro | Docker host (backend + MySQL) | ~$7.50 |
 | EBS 20GB gp3 | EC2 root disk + Docker volumes | ~$1.60 |
-| S3 | React `dist/` files | ~$0.01 |
-| CloudFront #1 | Frontend HTTPS | ~$0.25 |
-| CloudFront #2 | Backend HTTPS proxy | ~$0.25 |
+| S3 prod | React `dist/` files | ~$0.01 |
+| S3 deploy | CodeDeploy deployment bundles | ~$0.01 |
+| CloudFront #2 | Production frontend HTTPS | ~$0.25 |
+| CloudFront #3 | Production backend HTTPS proxy | ~$0.25 |
 | Elastic IP | Fixed public IP | $0 (while attached) |
-| **Total** | | **~$9.60/mo** |
+| CodeDeploy | Backend zero-downtime deploys | $0 (free for EC2) |
+| **Total** | | **~$9.62/mo** |
 
-**Not used:** RDS (saves ~$20/mo), ALB (saves ~$18/mo), ECS/Fargate, NAT Gateway.
+**Not used:** RDS, ALB, ECS/Fargate, NAT Gateway, staging S3/CloudFront.
 
 ---
 
@@ -56,8 +61,13 @@ Browsers block HTTPS pages from calling HTTP APIs (mixed-content). CloudFront #2
 
 | File | Purpose |
 |---|---|
-| `docker-compose.prod.yml` | Production Docker Compose (backend + MySQL, no hardcoded secrets) |
-| `.env.production.example` | Template for EC2 production env vars (committed to git) |
+| `.github/workflows/deploy.yml` | CI/CD pipeline (build + deploy on main push) |
+| `appspec.yml` | CodeDeploy deployment spec (lifecycle hooks) |
+| `scripts/stop_old.sh` | CodeDeploy: clear standby slot before deploy |
+| `scripts/build_image.sh` | CodeDeploy: build new Docker image |
+| `scripts/start_server.sh` | CodeDeploy: blue/green swap + Nginx reload |
+| `scripts/validate.sh` | CodeDeploy: final health check via Nginx |
+| `.env.production.example` | Template for EC2 env vars (committed to git) |
 | `.env.production` | Actual secrets on EC2 only (gitignored, never committed) |
 
 ---
@@ -78,14 +88,14 @@ brew install awscli
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
       "Resource": [
-        "arn:aws:s3:::pmapp-frontend-<account-id>",
-        "arn:aws:s3:::pmapp-frontend-<account-id>/*"
+        "arn:aws:s3:::pmapp-frontend-prod-898119315288",
+        "arn:aws:s3:::pmapp-frontend-prod-898119315288/*"
       ]
     },
     {
       "Effect": "Allow",
       "Action": ["cloudfront:CreateInvalidation"],
-      "Resource": "arn:aws:cloudfront::<account-id>:distribution/<cf1-distribution-id>"
+      "Resource": "arn:aws:cloudfront::898119315288:distribution/E2LA11ML4NNXJG"
     }
   ]
 }
@@ -94,63 +104,106 @@ brew install awscli
 aws configure
 ```
 
-### 1.2 EC2 Instance
+### 1.2 EC2 Instance ✅ Done
 
-1. EC2 Console → Region: **us-east-1**
-2. Create key pair: `pmapp-key` → download `pmapp-key.pem` → `chmod 400 pmapp-key.pem`
-3. Create Security Group `pmapp-ec2-sg`:
+- Elastic IP: `44.212.166.77`
+- Public DNS: `ec2-44-212-166-77.compute-1.amazonaws.com`
+- Key pair: `pmapp-key.pem`
+- Security Group `pmapp-ec2-sg`:
 
-   | Port | Source | Purpose |
-   |------|--------|---------|
-   | 22 | Your IP /32 | SSH (admin only) |
-   | 80 | 0.0.0.0/0 | Nginx → backend |
-   | 443 | 0.0.0.0/0 | Reserved for future HTTPS |
+  | Port | Source | Purpose |
+  |------|--------|---------|
+  | 22 | Your IP /32 | SSH for initial setup only |
+  | 80 | 0.0.0.0/0 | Nginx → backend (CloudFront #3 origin) |
 
-4. Launch instance:
-   - AMI: **Amazon Linux 2023**
-   - Type: **t3.micro**
-   - Storage: **20 GB gp3**
-   - Security group: `pmapp-ec2-sg`
-   - Auto-assign public IP: **Enable**
+> **Note:** EC2 must be in a **public subnet** for CloudFront to reach port 80. SSH (port 22) is only used for initial setup — CodeDeploy handles all future deploys.
 
-5. Allocate Elastic IP → Associate with instance
-6. Note your **`<elastic-ip>`** — used in all steps below
+### 1.3 S3 Buckets ✅ Done
 
-### 1.3 S3 Bucket
+- `pmapp-frontend-prod-898119315288` — production frontend
+- `pmapp-deploy-898119315288` — CodeDeploy deployment bundles (**create this one**)
 
-1. Create bucket: `pmapp-frontend-<account-id>`
-2. Region: us-east-1
-3. Block all public access: **ON**
+### 1.4 CloudFront #2 — Production Frontend ✅ Done
 
-### 1.4 CloudFront #1 — Frontend
+- Origin: `pmapp-frontend-prod-898119315288` S3 bucket
+- Distribution ID: `E1DSN3GZGZSDEW`
+- URL: `https://d1daiaablsduwd.cloudfront.net`
 
-1. Create Distribution → Origin: your S3 bucket
-2. Origin access: **Origin Access Control** → Create OAC → copy bucket policy to S3
-3. Default root object: `index.html`
-4. Custom error responses:
-   - 403 → `/index.html` → HTTP 200
-   - 404 → `/index.html` → HTTP 200
-5. Price class: North America + Europe only
-6. Note domain → **`FRONTEND_URL`**: `https://dXXXXXX.cloudfront.net`
+### 1.5 CloudFront #3 — Production Backend ✅ Done
 
-### 1.5 CloudFront #2 — Backend API
+- Origin: `ec2-44-212-166-77.compute-1.amazonaws.com` port 80
+- URL: `https://d334m16el7ohgc.cloudfront.net` → `VITE_API_URL_PROD`
 
-1. Create Distribution → Origin domain: `<elastic-ip>` (custom, type manually)
-2. Protocol: **HTTP only**, port **80**
-3. Cache policy: **CachingDisabled**
-4. Origin request policy: **AllViewerExceptHostHeader**
-5. Allowed HTTP methods: **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**
-6. Note domain → **`VITE_API_URL`**: `https://dYYYYYY.cloudfront.net`
+### 1.6 IAM Role for EC2 (CodeDeploy agent)
+
+1. IAM Console → **Roles** → Create role
+2. Trusted entity: **AWS service** → **EC2**
+3. Attach policy: `AmazonEC2RoleforAWSCodeDeploy`
+4. Name: `pmapp-ec2-role` → Create
+5. EC2 Console → your instance → **Actions → Security → Modify IAM role** → attach `pmapp-ec2-role`
+
+### 1.7 CodeDeploy Application + Deployment Group
+
+1. CodeDeploy Console → **Applications** → Create application
+   - Name: `pmapp`
+   - Compute platform: **EC2/On-premises**
+
+2. Create deployment group:
+   - Name: `pmapp-prod`
+   - Service role: create new role `pmapp-codedeploy-role` with `AWSCodeDeployRole` policy
+   - Deployment type: **In-place**
+   - Environment: **Amazon EC2 instances** → Tag: `Name` = `pmapp-ec2` (tag your EC2 instance with this)
+   - Deployment config: `CodeDeployDefault.AllAtOnce`
+   - Load balancer: **uncheck** (no ALB)
+
+### 1.8 Update IAM User `pmapp-deploy` Policy
+
+Add CodeDeploy + S3 deploy bucket permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::pmapp-frontend-prod-898119315288",
+        "arn:aws:s3:::pmapp-frontend-prod-898119315288/*",
+        "arn:aws:s3:::pmapp-deploy-898119315288",
+        "arn:aws:s3:::pmapp-deploy-898119315288/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation"],
+      "Resource": [
+        "arn:aws:cloudfront::898119315288:distribution/E1DSN3GZGZSDEW"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetDeployment",
+        "codedeploy:GetDeploymentConfig",
+        "codedeploy:RegisterApplicationRevision",
+        "codedeploy:GetApplicationRevision"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
 
 ---
 
-## Phase 2 — EC2 Server Setup
+## Phase 2 — EC2 Server Setup (one-time, via SSH)
 
 ```bash
-ssh -i pmapp-key.pem ec2-user@<elastic-ip>
+ssh -i ~/.ssh/pmapp-key.pem ec2-user@44.212.166.77
 ```
 
-### 2.1 Install Docker & Nginx
+### 2.1 Install Docker, Nginx, Git, CodeDeploy Agent
 
 ```bash
 sudo dnf update -y
@@ -159,33 +212,28 @@ sudo dnf update -y
 sudo dnf install -y docker
 sudo systemctl enable docker && sudo systemctl start docker
 sudo usermod -aG docker ec2-user
-# Log out and back in for group change to take effect
-exit
-ssh -i pmapp-key.pem ec2-user@<elastic-ip>
+exit  # log out for group change to take effect
+ssh -i ~/.ssh/pmapp-key.pem ec2-user@44.212.166.77
 
-# Docker Compose plugin
-sudo mkdir -p /usr/local/lib/docker/cli-plugins
-sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
-  -o /usr/local/lib/docker/cli-plugins/docker-compose
-sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-docker compose version  # verify
-
-# Nginx
-sudo dnf install -y nginx
+# Nginx + Git
+sudo dnf install -y nginx git
 sudo systemctl enable nginx && sudo systemctl start nginx
 
-# Git
-sudo dnf install -y git
+# CodeDeploy agent (Amazon Linux 2023)
+sudo dnf install -y ruby wget
+wget https://aws-codedeploy-us-east-1.s3.amazonaws.com/latest/install
+chmod +x ./install
+sudo ./install auto
+sudo systemctl enable codedeploy-agent && sudo systemctl start codedeploy-agent
+sudo systemctl status codedeploy-agent  # should show active (running)
 ```
 
-### 2.2 Nginx Reverse Proxy
+### 2.2 Nginx Config
 
-Create `/etc/nginx/conf.d/pmapp.conf`:
-```nginx
-# upstream block allows zero-downtime port swap via `nginx -s reload`
-# CI/CD uses `sed` to update the port, then reloads — no dropped connections
-upstream pmapp_backend {
-    server 127.0.0.1:3001;
+```bash
+sudo tee /etc/nginx/conf.d/pmapp-prod.conf > /dev/null <<'EOF'
+upstream pmapp_prod {
+    server 127.0.0.1:3001; # prod
 }
 
 server {
@@ -193,7 +241,7 @@ server {
     server_name _;
 
     location /api/ {
-        proxy_pass http://pmapp_backend;
+        proxy_pass http://pmapp_prod;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -201,19 +249,31 @@ server {
         proxy_read_timeout 60s;
     }
 }
-```
-
-```bash
+EOF
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-### 2.3 Clone Repo & Configure Secrets
+> The `# prod` comment anchor is critical — the deploy script uses `sed` to target it when swapping blue/green ports.
+
+### 2.3 Sudoers & Docker Network
 
 ```bash
-# Set up SSH key for GitHub (or use HTTPS)
+# Allow ec2-user to reload Nginx without password (deploy scripts need this)
+echo "ec2-user ALL=(ALL) NOPASSWD: /usr/sbin/nginx" \
+  | sudo tee /etc/sudoers.d/nginx-reload
+sudo chmod 440 /etc/sudoers.d/nginx-reload
+
+# Shared Docker network for DB + backend containers
+docker network create pmapp-network
+```
+
+### 2.4 Clone Repo & Configure Secrets
+
+```bash
+# Set up SSH deploy key for GitHub
 ssh-keygen -t ed25519 -C "ec2-pmapp" -f ~/.ssh/id_ed25519 -N ""
 cat ~/.ssh/id_ed25519.pub
-# Add this key to GitHub → Settings → Deploy Keys (read-only is enough)
+# Add this key to GitHub → Settings → Deploy Keys (read-only)
 
 # Clone
 git clone git@github.com:vinhlk32/project-management.git /opt/pmapp
@@ -229,8 +289,8 @@ Fill in `.env.production`:
 ```
 PORT=3001
 NODE_ENV=production
-FRONTEND_URL=https://dXXXXXX.cloudfront.net
-DB_HOST=db
+FRONTEND_URL=https://d1daiaablsduwd.cloudfront.net   # CloudFront #2 (prod frontend)
+DB_HOST=pmapp-db-prod
 DB_PORT=3306
 DB_NAME=projectmanager
 DB_USER=pmapp_user
@@ -241,10 +301,8 @@ JWT_REFRESH_SECRET=<same command, different value>
 
 ### 2.4 One-time Blue-Green Prerequisites
 
-The CI/CD pipeline runs containers directly (not via docker compose) and needs to reload Nginx without a password. Run these once on EC2:
-
 ```bash
-# Create a dedicated Docker network shared by DB and backend containers
+# Create a Docker network shared by DB and backend containers
 docker network create pmapp-network
 
 # Allow ec2-user to reload Nginx without sudo password (CI/CD needs this)
@@ -253,42 +311,40 @@ echo "ec2-user ALL=(ALL) NOPASSWD: /usr/sbin/nginx" \
 sudo chmod 440 /etc/sudoers.d/nginx-reload
 ```
 
-### 2.5 Start the App
-
-Blue-green manages backend containers directly (not via docker compose), so start MySQL and the initial backend (blue slot) manually the first time:
+### 2.5 Start the App (First Boot)
 
 ```bash
 cd /opt/pmapp
 
 # Start MySQL
 docker run -d \
-  --name pmapp-db \
+  --name pmapp-db-prod \
   --network pmapp-network \
   -e MYSQL_ROOT_PASSWORD=$(grep DB_PASSWORD .env.production | cut -d= -f2) \
   -e MYSQL_DATABASE=projectmanager \
   -e MYSQL_USER=$(grep DB_USER .env.production | cut -d= -f2) \
   -e MYSQL_PASSWORD=$(grep DB_PASSWORD .env.production | cut -d= -f2) \
-  -v mysql_data:/var/lib/mysql \
+  -v mysql_prod_data:/var/lib/mysql \
   --restart unless-stopped \
   mysql:8.0
 
-# Wait ~30s for MySQL, then start backend on blue slot (:3001)
-docker build -t pmapp-backend:current ./backend
+# Wait ~30s for MySQL, then start backend (blue slot = port 3001)
+docker build -t pmapp-backend:prod-current ./backend
 docker run -d \
-  --name pmapp-backend-blue \
+  --name pmapp-prod-blue \
   --network pmapp-network \
   --env-file .env.production \
-  -e DB_HOST=pmapp-db \
+  -e DB_HOST=pmapp-db-prod \
   -e PORT=3001 \
   -p 127.0.0.1:3001:3001 \
   --restart unless-stopped \
-  pmapp-backend:current
+  pmapp-backend:prod-current
 
 # Verify
 curl http://localhost:3001/api/health   # should return 200
 
 # Seed admin user (first time only)
-docker exec pmapp-backend-blue node seed-admin.js
+docker exec pmapp-prod-blue node seed-admin.js
 ```
 
 ### 2.6 Auto-restart on EC2 Reboot
@@ -313,75 +369,77 @@ The `|| ''` fallback keeps local dev working via the Vite dev-proxy unchanged.
 
 ---
 
-## Phase 4 — CI/CD (GitHub Actions)
+## Phase 4 — CI/CD (GitHub Actions + CodeDeploy)
 
-The pipeline lives in `.github/workflows/deploy.yml` and triggers on every push to `dev`.
+Pipeline: `.github/workflows/deploy.yml` — triggers only on `main` push for deploys.
 
 ### Jobs
 
 | Job | Trigger | What it does |
 |---|---|---|
-| **Lint & Build** | all pushes + PRs | `npm ci` → `npm run build` (with `VITE_API_URL`) → uploads `dist/` artifact |
-| **Deploy Frontend** | push to `dev` only | Downloads artifact → `aws s3 sync` → CloudFront invalidation |
-| **Deploy Backend** | push to `dev` only | SSH into EC2 → `git pull` → `docker compose up -d --build` → health check |
+| **Build** | all pushes + PRs | `npm ci` → `npm run build` → uploads `dist/` artifact |
+| **Deploy Frontend** | push to `main` | `aws s3 sync` → CF#2 invalidation |
+| **Deploy Backend** | push to `main` | zip bundle → S3 → CodeDeploy → blue/green on EC2 |
 
 ### GitHub Secrets to configure
 
-Go to **GitHub → repo → Settings → Secrets and variables → Actions** and add:
+Go to **GitHub → repo → Settings → Environments** → create `production` environment (set required reviewer).
+
+**`production` environment secrets:**
 
 | Secret | Value |
 |---|---|
-| `VITE_API_URL` | `https://dYYYYYY.cloudfront.net` (CloudFront #2) |
+| `VITE_API_URL_PROD` | `https://d334m16el7ohgc.cloudfront.net` |
+| `S3_BUCKET_PROD` | `pmapp-frontend-prod-898119315288` |
+| `CF_DISTRIBUTION_ID_PROD` | `E1DSN3GZGZSDEW` |
+| `S3_DEPLOY_BUCKET` | `pmapp-deploy-898119315288` |
+
+**Repository-level secrets:**
+
+| Secret | Value |
+|---|---|
 | `AWS_ACCESS_KEY_ID` | IAM user `pmapp-deploy` access key |
 | `AWS_SECRET_ACCESS_KEY` | IAM user `pmapp-deploy` secret key |
-| `S3_BUCKET` | `pmapp-frontend-<account-id>` |
-| `CF_FRONTEND_DISTRIBUTION_ID` | CloudFront #1 distribution ID |
-| `EC2_HOST` | Your Elastic IP address |
-| `EC2_SSH_KEY` | Full content of `pmapp-key.pem` |
-
-### IAM policy for `pmapp-deploy`
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetObject"],
-      "Resource": [
-        "arn:aws:s3:::pmapp-frontend-<account-id>",
-        "arn:aws:s3:::pmapp-frontend-<account-id>/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["cloudfront:CreateInvalidation"],
-      "Resource": "arn:aws:cloudfront::<account-id>:distribution/<cf1-distribution-id>"
-    }
-  ]
-}
-```
 
 ### Pipeline behaviour
 
-- **PRs** → only runs Build job (no deploy); blocks merge if build fails
-- **Push to dev** → Build → Deploy Frontend + Deploy Backend (parallel)
+- **PRs / dev push** → Build only; blocks merge if build fails
+- **Push to `main`** → Build → Deploy Frontend + Deploy Backend in parallel (requires reviewer approval)
 - **Concurrent pushes** → new push cancels in-progress deployment
-- **Backend health check** → 12 × 5s retries; prints logs and fails the job if unreachable
+- **Backend deploy** → CodeDeploy runs `stop_old.sh` → `build_image.sh` → `start_server.sh` → `validate.sh`; auto-rollback on failure
+- **Backend health check** → 18 × 5s retries (~90s total); auto-rollback on failure
 
 ---
 
-## Phase 5 — First Frontend Deploy
+## Phase 5 — First S3 Seed (Manual, Before CI/CD Runs)
+
+Both staging and prod frontend point to the same prod backend (CF#3), so one build works for both.
 
 ```bash
-# From local machine, inside frontend/
 cd ~/project-management/frontend
-VITE_API_URL=https://dYYYYYY.cloudfront.net npm run build
-aws s3 sync dist/ s3://pmapp-frontend-<account-id>/ --delete
-aws cloudfront create-invalidation --distribution-id <cf1-id> --paths "/*"
+
+VITE_API_URL=https://d334m16el7ohgc.cloudfront.net npm run build  # CF#3 prod backend URL
+
+# Seed staging S3
+aws s3 sync dist/ s3://pmapp-frontend-staging-898119315288/ --delete
+aws cloudfront create-invalidation --distribution-id E2LA11ML4NNXJG --paths "/*"
+
+# Seed prod S3
+aws s3 sync dist/ s3://pmapp-frontend-prod-898119315288/ --delete
+aws cloudfront create-invalidation --distribution-id E1DSN3GZGZSDEW --paths "/*"
 ```
 
-Open `https://dXXXXXX.cloudfront.net` — app should load and login should work.
+Open staging frontend: `https://dc2wyq9kfkge2.cloudfront.net` (CF#1) — calls prod backend.
+Open prod frontend: `https://d1daiaablsduwd.cloudfront.net` (CF#2) — calls prod backend.
+
+## Phase 6 — Promote to Production
+
+```bash
+git checkout main
+git merge dev
+git push origin main
+# → triggers reviewer approval → auto-deploys to production
+```
 
 ---
 
@@ -390,7 +448,7 @@ Open `https://dXXXXXX.cloudfront.net` — app should load and login should work.
 ### Deploy new backend version
 ```bash
 # SSH into EC2
-ssh -i pmapp-key.pem ec2-user@<elastic-ip>
+ssh -i pmapp-key.pem ec2-user@44.212.166.77
 cd /opt/pmapp
 
 git pull
@@ -405,9 +463,9 @@ docker compose -f docker-compose.prod.yml ps
 ```bash
 # From local machine
 cd ~/project-management/frontend
-VITE_API_URL=https://dYYYYYY.cloudfront.net npm run build
-aws s3 sync dist/ s3://pmapp-frontend-<account-id>/ --delete
-aws cloudfront create-invalidation --distribution-id <cf1-id> --paths "/*"
+VITE_API_URL=https://d334m16el7ohgc.cloudfront.net npm run build
+aws s3 sync dist/ s3://pmapp-frontend-prod-898119315288/ --delete
+aws cloudfront create-invalidation --distribution-id E1DSN3GZGZSDEW --paths "/*"
 ```
 
 ---
@@ -421,43 +479,41 @@ crontab -e
 
 Add:
 ```
-0 2 * * * docker exec project-management-db-1 mysqldump -u pmapp_user -p'<password>' projectmanager | gzip > /opt/pmapp/backups/pmapp_$(date +\%Y\%m\%d).sql.gz && find /opt/pmapp/backups -name "*.sql.gz" -mtime +7 -delete
+0 2 * * * docker exec pmapp-db-prod mysqldump -u pmapp_user -p'<password>' projectmanager | gzip > /opt/pmapp/backups/pmapp_$(date +\%Y\%m\%d).sql.gz && find /opt/pmapp/backups -name "*.sql.gz" -mtime +7 -delete
 ```
 
 ---
 
 ## Verification Checklist
 
-- [ ] `curl http://<elastic-ip>/api/health` → 200 OK
-- [ ] `curl https://dYYYYYY.cloudfront.net/api/health` → 200 OK
-- [ ] `https://dXXXXXX.cloudfront.net` loads React app
+- [ ] `curl http://44.212.166.77/api/health` → 200 OK (direct EC2)
+- [ ] `curl https://d334m16el7ohgc.cloudfront.net/api/health` → 200 OK (CloudFront #3 prod backend)
+- [ ] `https://<cf2-domain>` loads React app (CloudFront #2 prod frontend)
 - [ ] Login with `admin@admin.com` / `Admin@123` works
-- [ ] Browser DevTools → no CORS errors, API calls go to `https://dYYYYYY.cloudfront.net`
-- [ ] `docker compose -f docker-compose.prod.yml ps` → both containers healthy
+- [ ] Browser DevTools → no CORS errors, API calls go to CF#3 URL
+- [ ] `docker ps` → `pmapp-prod-blue` (or green) and `pmapp-db-prod` running
+- [ ] `https://<cf1-domain>` loads React app (CloudFront #1 staging frontend preview)
 
 ---
 
 ## Useful Commands
 
 ```bash
-# View logs
-ssh -i pmapp-key.pem ec2-user@<elastic-ip> \
-  "cd /opt/pmapp && docker compose -f docker-compose.prod.yml logs -f"
+# Check all running containers
+ssh -i pmapp-key.pem ec2-user@44.212.166.77 "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 
-# Check container status
-ssh -i pmapp-key.pem ec2-user@<elastic-ip> \
-  "cd /opt/pmapp && docker compose -f docker-compose.prod.yml ps"
+# View backend logs (replace blue with green if green is active)
+ssh -i pmapp-key.pem ec2-user@44.212.166.77 "docker logs -f pmapp-prod-blue"
 
-# Restart backend only (no rebuild)
-ssh -i pmapp-key.pem ec2-user@<elastic-ip> \
-  "cd /opt/pmapp && docker compose -f docker-compose.prod.yml restart backend"
+# Health check
+ssh -i pmapp-key.pem ec2-user@44.212.166.77 "curl -s http://localhost:3001/api/health"
 
 # Check memory/disk
-ssh -i pmapp-key.pem ec2-user@<elastic-ip> "free -m && df -h"
+ssh -i pmapp-key.pem ec2-user@44.212.166.77 "free -m && df -h"
 
 # Access MySQL shell
-ssh -i pmapp-key.pem ec2-user@<elastic-ip> \
-  "docker exec -it project-management-db-1 mysql -u pmapp_user -p projectmanager"
+ssh -i pmapp-key.pem ec2-user@44.212.166.77 \
+  "docker exec -it pmapp-db-prod mysql -u pmapp_user -p projectmanager"
 ```
 
 ---
@@ -466,11 +522,14 @@ ssh -i pmapp-key.pem ec2-user@<elastic-ip> \
 
 | Item | Value |
 |---|---|
-| Elastic IP | |
-| S3 Bucket name | pmapp-frontend-`<account-id>` |
-| CloudFront #1 URL (Frontend) | https:// |
-| CloudFront #1 Distribution ID | |
-| CloudFront #2 URL (Backend) | https:// |
-| CloudFront #2 Distribution ID | |
-| EC2 Key pair file | pmapp-key.pem |
+| Elastic IP | 44.212.166.77 |
+| EC2 Public DNS | ec2-44-212-166-77.compute-1.amazonaws.com |
+| S3 Staging bucket | pmapp-frontend-staging-898119315288 |
+| S3 Prod bucket | pmapp-frontend-prod-898119315288 |
+| CloudFront #1 URL (Staging frontend) | https://dc2wyq9kfkge2.cloudfront.net |
+| CloudFront #1 Distribution ID | E2LA11ML4NNXJG |
+| CloudFront #2 URL (Prod frontend) | https://d1daiaablsduwd.cloudfront.net |
+| CloudFront #2 Distribution ID | E1DSN3GZGZSDEW |
+| CloudFront #3 URL (Prod backend) | https://d334m16el7ohgc.cloudfront.net |
+| EC2 Key pair file | pmapp-key.pem (key pair name: pmapp-key) |
 | Admin login | admin@admin.com / Admin@123 |

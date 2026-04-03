@@ -1,24 +1,24 @@
 name: CI / Deploy
 
 # ── Triggers ──────────────────────────────────────────────────────────────────
-# dev  → staging environment
-# main → production environment
-# PRs targeting either branch → build only (no deploy)
+# dev  → build only (CI check, test locally before merging)
+# main → build + deploy to production (frontend → S3, backend → CodeDeploy)
+# PRs  → build only, no deploy
 on:
   push:
     branches: [dev, main]
   pull_request:
     branches: [dev, main]
 
-# One deployment per branch at a time; new push cancels in-progress
+# One deployment at a time; new push cancels in-progress
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ── Job 1: Lint & Build ─────────────────────────────────────────────────────
+  # ── Job 1: Build ─────────────────────────────────────────────────────────────
   build:
-    name: Lint & Build
+    name: Build
     runs-on: ubuntu-latest
 
     steps:
@@ -36,13 +36,6 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      - name: Build frontend (staging)
-        if: github.ref == 'refs/heads/dev'
-        run: npm run build
-        working-directory: frontend
-        env:
-          VITE_API_URL: ${{ secrets.VITE_API_URL_STAGING }}
-
       - name: Build frontend (production)
         if: github.ref == 'refs/heads/main'
         run: npm run build
@@ -50,31 +43,32 @@ jobs:
         env:
           VITE_API_URL: ${{ secrets.VITE_API_URL_PROD }}
 
-      - name: Build frontend (PR — no env, local proxy)
-        if: github.event_name == 'pull_request'
+      - name: Build frontend (CI check — dev branch / PRs)
+        if: github.ref != 'refs/heads/main'
         run: npm run build
         working-directory: frontend
 
-      - name: Upload build artifact
+      - name: Upload frontend artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-dist-${{ github.ref_name }}
+          name: frontend-dist
           path: frontend/dist/
           retention-days: 1
 
-  # ── Job 2a: Deploy Frontend → STAGING (dev branch) ──────────────────────────
-  deploy-frontend-staging:
-    name: Deploy Frontend (STAGING)
+  # ── Job 2: Deploy Frontend → S3 + CloudFront (main only) ─────────────────────
+  deploy-frontend:
+    name: Deploy Frontend
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    environment: staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
 
     steps:
-      - name: Download build artifact
+      - name: Download frontend artifact
         uses: actions/download-artifact@v4
         with:
-          name: frontend-dist-dev
+          name: frontend-dist
           path: dist/
 
       - name: Configure AWS credentials
@@ -84,39 +78,32 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            us-east-1
 
-      - name: Sync to S3 (staging)
-        env:
-          BUCKET: ${{ secrets.S3_BUCKET_STAGING }}
+      - name: Sync to S3
         run: |
-          aws s3 sync dist/ s3://$BUCKET/ \
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_PROD }}/ \
             --delete \
             --cache-control "public,max-age=31536000,immutable" \
             --exclude "index.html"
-          aws s3 cp dist/index.html s3://$BUCKET/index.html \
+          aws s3 cp dist/index.html s3://${{ secrets.S3_BUCKET_PROD }}/index.html \
             --cache-control "no-cache,no-store,must-revalidate"
 
-      - name: Invalidate CloudFront (staging)
-        env:
-          DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID_STAGING }}
+      - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
-            --distribution-id $DIST_ID \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID_PROD }} \
             --paths "/*"
 
-  # ── Job 2b: Deploy Frontend → PRODUCTION (main branch) ──────────────────────
-  deploy-frontend-prod:
-    name: Deploy Frontend (PRODUCTION)
+  # ── Job 3: Deploy Backend → CodeDeploy blue/green (main only) ────────────────
+  deploy-backend:
+    name: Deploy Backend
     runs-on: ubuntu-latest
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
 
     steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist-main
-          path: dist/
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -125,179 +112,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            us-east-1
 
-      - name: Sync to S3 (production)
-        env:
-          BUCKET: ${{ secrets.S3_BUCKET_PROD }}
+      - name: Package deployment bundle
         run: |
-          aws s3 sync dist/ s3://$BUCKET/ \
-            --delete \
-            --cache-control "public,max-age=31536000,immutable" \
-            --exclude "index.html"
-          aws s3 cp dist/index.html s3://$BUCKET/index.html \
-            --cache-control "no-cache,no-store,must-revalidate"
+          zip -r deployment.zip appspec.yml scripts/ backend/
 
-      - name: Invalidate CloudFront (production)
-        env:
-          DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID_PROD }}
+      - name: Upload bundle to S3
         run: |
-          aws cloudfront create-invalidation \
-            --distribution-id $DIST_ID \
-            --paths "/*"
+          aws s3 cp deployment.zip \
+            s3://${{ secrets.S3_DEPLOY_BUCKET }}/deployment-${{ github.sha }}.zip
 
-  # ── Job 3a: Deploy Backend → STAGING EC2 — zero-downtime blue/green ─────────
-  deploy-backend-staging:
-    name: Deploy Backend (STAGING)
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    environment: staging
-
-    steps:
-      - name: Zero-downtime deploy to staging EC2
-        uses: appleboy/ssh-action@v1
-        with:
-          host:     ${{ secrets.EC2_HOST_STAGING }}
-          username: ec2-user
-          key:      ${{ secrets.EC2_SSH_KEY_STAGING }}
-          timeout:  180s
-          script: |
-            set -e
-            cd /opt/pmapp
-
-            # ── Determine current (blue) and next (green) ports ──────────────
-            BLUE_PORT=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' pmapp-backend-blue 2>/dev/null || echo "")
-            if [ "$BLUE_PORT" = "3001" ]; then
-              CURRENT=blue; CURRENT_PORT=3001
-              NEXT=green;   NEXT_PORT=3002
-            else
-              CURRENT=green; CURRENT_PORT=3002
-              NEXT=blue;     NEXT_PORT=3001
-            fi
-            echo "▶ Current slot: $CURRENT (:$CURRENT_PORT) → deploying to: $NEXT (:$NEXT_PORT)"
-
-            # ── Pull latest code ─────────────────────────────────────────────
-            git pull origin dev
-
-            # ── Build new image ──────────────────────────────────────────────
-            docker build -t pmapp-backend:new ./backend
-
-            # ── Start next container on standby port ─────────────────────────
-            docker rm -f pmapp-backend-$NEXT 2>/dev/null || true
-            docker run -d \
-              --name pmapp-backend-$NEXT \
-              --network pmapp-network \
-              --env-file .env.production \
-              -e DB_HOST=pmapp-db \
-              -e PORT=3001 \
-              -p 127.0.0.1:$NEXT_PORT:3001 \
-              --restart unless-stopped \
-              pmapp-backend:new
-
-            # ── Health check new container ───────────────────────────────────
-            echo "▶ Health checking new container on :$NEXT_PORT..."
-            for i in $(seq 1 18); do
-              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEXT_PORT/api/health)
-              if [ "$STATUS" = "200" ]; then
-                echo "✅ New container healthy (attempt $i)"
-                break
-              fi
-              if [ "$i" = "18" ]; then
-                echo "❌ New container failed health check — rolling back"
-                docker rm -f pmapp-backend-$NEXT
-                exit 1
-              fi
-              echo "  Attempt $i: status=$STATUS, retrying..."
-              sleep 5
-            done
-
-            # ── Swap Nginx upstream — zero-downtime reload ───────────────────
-            echo "▶ Swapping Nginx upstream to :$NEXT_PORT..."
-            sudo sed -i "s|server 127.0.0.1:[0-9]*;|server 127.0.0.1:$NEXT_PORT;|" \
-              /etc/nginx/conf.d/pmapp.conf
-            sudo nginx -t
-            sudo nginx -s reload
-            echo "✅ Nginx reloaded — traffic now on :$NEXT_PORT"
-
-            # ── Stop old container ───────────────────────────────────────────
-            docker rm -f pmapp-backend-$CURRENT 2>/dev/null || true
-            docker image tag pmapp-backend:new pmapp-backend:current
-            echo "✅ Staging deploy complete — slot: $NEXT"
-
-  # ── Job 3b: Deploy Backend → PRODUCTION EC2 — zero-downtime blue/green ──────
-  deploy-backend-prod:
-    name: Deploy Backend (PRODUCTION)
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment: production
-
-    steps:
-      - name: Zero-downtime deploy to production EC2
-        uses: appleboy/ssh-action@v1
-        with:
-          host:     ${{ secrets.EC2_HOST_PROD }}
-          username: ec2-user
-          key:      ${{ secrets.EC2_SSH_KEY_PROD }}
-          timeout:  180s
-          script: |
-            set -e
-            cd /opt/pmapp
-
-            # ── Determine current (blue) and next (green) ports ──────────────
-            BLUE_PORT=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "3001/tcp") 0).HostPort}}' pmapp-backend-blue 2>/dev/null || echo "")
-            if [ "$BLUE_PORT" = "3001" ]; then
-              CURRENT=blue; CURRENT_PORT=3001
-              NEXT=green;   NEXT_PORT=3002
-            else
-              CURRENT=green; CURRENT_PORT=3002
-              NEXT=blue;     NEXT_PORT=3001
-            fi
-            echo "▶ Current slot: $CURRENT (:$CURRENT_PORT) → deploying to: $NEXT (:$NEXT_PORT)"
-
-            # ── Pull latest code ─────────────────────────────────────────────
-            git pull origin main
-
-            # ── Build new image ──────────────────────────────────────────────
-            docker build -t pmapp-backend:new ./backend
-
-            # ── Start next container on standby port ─────────────────────────
-            docker rm -f pmapp-backend-$NEXT 2>/dev/null || true
-            docker run -d \
-              --name pmapp-backend-$NEXT \
-              --network pmapp-network \
-              --env-file .env.production \
-              -e DB_HOST=pmapp-db \
-              -e PORT=3001 \
-              -p 127.0.0.1:$NEXT_PORT:3001 \
-              --restart unless-stopped \
-              pmapp-backend:new
-
-            # ── Health check new container ───────────────────────────────────
-            echo "▶ Health checking new container on :$NEXT_PORT..."
-            for i in $(seq 1 18); do
-              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEXT_PORT/api/health)
-              if [ "$STATUS" = "200" ]; then
-                echo "✅ New container healthy (attempt $i)"
-                break
-              fi
-              if [ "$i" = "18" ]; then
-                echo "❌ New container failed health check — rolling back"
-                docker rm -f pmapp-backend-$NEXT
-                exit 1
-              fi
-              echo "  Attempt $i: status=$STATUS, retrying..."
-              sleep 5
-            done
-
-            # ── Swap Nginx upstream — zero-downtime reload ───────────────────
-            echo "▶ Swapping Nginx upstream to :$NEXT_PORT..."
-            sudo sed -i "s|server 127.0.0.1:[0-9]*;|server 127.0.0.1:$NEXT_PORT;|" \
-              /etc/nginx/conf.d/pmapp.conf
-            sudo nginx -t
-            sudo nginx -s reload
-            echo "✅ Nginx reloaded — traffic now on :$NEXT_PORT"
-
-            # ── Stop old container ───────────────────────────────────────────
-            docker rm -f pmapp-backend-$CURRENT 2>/dev/null || true
-            docker image tag pmapp-backend:new pmapp-backend:current
-            echo "✅ Production deploy complete — slot: $NEXT"
+      - name: Create CodeDeploy deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name pmapp \
+            --deployment-group-name pmapp-prod \
+            --s3-location bucket=${{ secrets.S3_DEPLOY_BUCKET }},key=deployment-${{ github.sha }}.zip,bundleType=zip \
+            --file-exists-behavior OVERWRITE \
+            --query 'deploymentId' --output text)
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          aws deploy wait deployment-successful --deployment-id $DEPLOYMENT_ID
+          echo "✅ CodeDeploy deployment successful"
