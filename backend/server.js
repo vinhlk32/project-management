@@ -58,13 +58,19 @@ const loginLimiter = rateLimit({
 });
 
 // ── CSRF protection ────────────────────────────────────────────────────────────
+// Frontend and backend are on different CloudFront domains, so the browser's
+// third-party cookie policy (Safari ITP) blocks the csrf_token cookie from being
+// sent cross-origin — making the double-submit cookie pattern unworkable.
+// The X-CSRF-Token header alone is sufficient here because:
+//   1. Strict CORS (origin: FRONTEND_URL) blocks preflighted requests from other origins.
+//   2. Custom headers cannot be set by cross-origin requests without a passing preflight.
+//   3. Bearer token auth provides independent identity verification on every request.
 const csrfProtect = (req, res, next) => {
   const safeMethods = ['GET', 'HEAD', 'OPTIONS'];
   if (safeMethods.includes(req.method)) return next();
   if (req.path.startsWith('/api/auth/')) return next(); // login/refresh don't have token yet
   const headerToken = req.headers['x-csrf-token'];
-  const cookieToken = req.cookies?.csrf_token;
-  if (!headerToken || !cookieToken || headerToken !== cookieToken) {
+  if (!headerToken) {
     return res.status(403).json({ error: 'Invalid CSRF token' });
   }
   next();
