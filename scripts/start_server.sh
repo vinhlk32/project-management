@@ -1,6 +1,7 @@
 #!/bin/bash
 # ApplicationStart — blue/green swap: start new container, health check, swap Nginx, stop old
 set -e
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 cd /opt/pmapp
 
