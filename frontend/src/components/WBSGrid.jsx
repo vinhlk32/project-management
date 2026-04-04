@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 
 const COLUMNS = [
-  { key: 'wbs',            label: '#',            width: 44,  editable: false },
+  { key: 'wbs',            label: '#',            width: 60,  editable: false },
   { key: 'title',          label: 'Task Name',    width: 240, editable: true  },
   { key: 'estimated_days', label: 'Days',         width: 60,  editable: true  },
   { key: 'start_date',     label: 'Start',        width: 110, editable: true  },
@@ -27,16 +27,40 @@ function addDays(dateStr, n) {
   return d.toISOString().split('T')[0];
 }
 
+// Build flat list: top-level tasks with subtasks inserted after their parent,
+// each row gets _depth (0 = top-level) and _wbs ("1", "1.1", "2", etc.)
+function buildRows(allTasks) {
+  const byParent = {};
+  allTasks.forEach(t => {
+    const key = t.parent_id ?? 'root';
+    if (!byParent[key]) byParent[key] = [];
+    byParent[key].push(t);
+  });
+
+  const result = [];
+  function walk(parentKey, depth, parentWbs) {
+    (byParent[parentKey] || []).forEach((task, idx) => {
+      const wbs = parentWbs ? `${parentWbs}.${idx + 1}` : `${idx + 1}`;
+      result.push({ ...task, _depth: depth, _wbs: wbs });
+      walk(task.id, depth + 1, wbs);
+    });
+  }
+  walk('root', 0, '');
+  return result;
+}
+
 export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksChange, onEditTask }) {
   const { authFetch } = useAuth();
   const [rows, setRows]               = useState([]);
   const [deps, setDeps]               = useState([]);
   const [editingCell, setEditingCell] = useState(null); // { rowIdx, col }
   const [saving, setSaving]           = useState(new Set());
-  const inputRef = useRef(null);
+  const inputRef    = useRef(null);
+  const skipBlurRef = useRef(false); // prevent double-save when keyboard commit fires blur
 
+  // Rebuild flat tree whenever allTasks changes
   useEffect(() => {
-    setRows(allTasks.filter(t => !t.parent_id));
+    setRows(buildRows(allTasks));
   }, [allTasks]);
 
   useEffect(() => {
@@ -46,6 +70,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       .catch(() => {});
   }, [project.id]);
 
+  // Auto-focus input when editing cell changes
   useEffect(() => {
     if (editingCell && inputRef.current) {
       inputRef.current.focus();
@@ -53,19 +78,26 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     }
   }, [editingCell]);
 
+  // Map task id → wbs string for predecessor display
+  const wbsByTaskId = useMemo(() => {
+    const map = {};
+    rows.forEach(r => { map[r.id] = r._wbs; });
+    return map;
+  }, [rows]);
+
   const getPredecessorStr = useCallback((taskId) => {
     return deps
       .filter(d => d.successor_id === taskId)
       .map(d => {
-        const idx = rows.findIndex(r => r.id === d.predecessor_id);
-        if (idx < 0) return null;
-        const suffix = d.type !== 'FS' ? d.type : '';
+        const wbs = wbsByTaskId[d.predecessor_id];
+        if (!wbs) return null;
+        const suffix = d.type && d.type !== 'FS' ? d.type : '';
         const lag    = d.lag ? (d.lag > 0 ? `+${d.lag}` : `${d.lag}`) : '';
-        return `${idx + 1}${suffix}${lag}`;
+        return `${wbs}${suffix}${lag}`;
       })
       .filter(Boolean)
       .join(', ');
-  }, [deps, rows]);
+  }, [deps, wbsByTaskId]);
 
   const applyAffected = useCallback((affected, baseRows) => {
     if (!affected?.length) return baseRows;
@@ -75,7 +107,11 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     });
   }, []);
 
+  // Core save: PUT task, then apply affected (successor date propagation)
   const saveField = useCallback(async (task, field, value) => {
+    // Skip no-op saves
+    if (task[field] === value) return;
+
     setSaving(prev => new Set(prev).add(task.id));
 
     const body = {
@@ -93,9 +129,9 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       [field]: value,
     };
 
-    // Recalculate due_date when days or start changes
-    const days  = field === 'estimated_days' ? Number(value) : (task.estimated_days || 0);
-    const start = field === 'start_date'     ? value         : task.start_date;
+    // Auto-compute due_date when days or start_date changes
+    const days  = field === 'estimated_days' ? Number(value)    : (task.estimated_days || 0);
+    const start = field === 'start_date'     ? (value || null)  : task.start_date;
     if (days > 0 && start) body.due_date = addDays(start, days - 1);
 
     try {
@@ -103,31 +139,50 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       if (!res.ok) return;
       const { task: updated, affected } = await res.json();
 
+      // Update rows (preserves _depth / _wbs metadata) + propagate affected successors
       setRows(prev => {
         const next = prev.map(r => r.id === updated.id ? { ...r, ...updated } : r);
         return applyAffected(affected, next);
       });
+
+      // Propagate up to TaskList so other views stay in sync
       onTasksChange?.(prev => {
         const next = prev.map(t => t.id === updated.id ? { ...t, ...updated } : t);
-        return affected?.length ? next.map(t => { const a = affected.find(x => x.id === t.id); return a ? { ...t, ...a } : t; }) : next;
+        if (!affected?.length) return next;
+        return next.map(t => {
+          const a = affected.find(x => x.id === t.id);
+          return a ? { ...t, ...a } : t;
+        });
       });
     } finally {
       setSaving(prev => { const s = new Set(prev); s.delete(task.id); return s; });
     }
   }, [authFetch, applyAffected, onTasksChange]);
 
-  const createRow = useCallback(async (afterIdx) => {
+  // Blur handler — skipped when keyboard (Enter/Tab/Esc) already handled the commit
+  const handleBlur = useCallback((task, col, value) => {
+    if (skipBlurRef.current) {
+      skipBlurRef.current = false;
+      return;
+    }
+    setEditingCell(null);
+    saveField(task, col, value);
+  }, [saveField]);
+
+  const createRow = useCallback(async (afterIdx, parentId = null) => {
     const res = await authFetch('/api/tasks', {
       method: 'POST',
-      body: JSON.stringify({ project_id: project.id, title: 'New Task', status: 'todo', priority: 'medium' }),
+      body: JSON.stringify({
+        project_id: project.id,
+        title: 'New Task',
+        status: 'todo',
+        priority: 'medium',
+        parent_id: parentId,
+      }),
     });
     if (!res.ok) return;
     const newTask = await res.json();
-    setRows(prev => {
-      const next = [...prev];
-      next.splice(afterIdx + 1, 0, newTask);
-      return next;
-    });
+    // Let allTasks update via onTasksChange → useEffect will rebuild rows
     onTasksChange?.(prev => [...prev, newTask]);
     setEditingCell({ rowIdx: afterIdx + 1, col: 'title' });
   }, [authFetch, project.id, onTasksChange]);
@@ -136,8 +191,8 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (!window.confirm(`Delete "${task.title}"?`)) return;
     const res = await authFetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
     if (res.ok) {
-      setRows(prev => prev.filter(r => r.id !== task.id));
-      onTasksChange?.(prev => prev.filter(t => t.id !== task.id));
+      // Remove task and any of its subtasks from parent state
+      onTasksChange?.(prev => prev.filter(t => t.id !== task.id && t.parent_id !== task.id));
     }
   }, [authFetch, onTasksChange]);
 
@@ -148,7 +203,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       else if (rowIdx < rows.length - 1)     setEditingCell({ rowIdx: rowIdx + 1, col: EDITABLE_KEYS[0] });
       else                                   setEditingCell(null);
     } else {
-      if (colIdx > 0)   setEditingCell({ rowIdx, col: EDITABLE_KEYS[colIdx - 1] });
+      if (colIdx > 0)      setEditingCell({ rowIdx, col: EDITABLE_KEYS[colIdx - 1] });
       else if (rowIdx > 0) setEditingCell({ rowIdx: rowIdx - 1, col: EDITABLE_KEYS[EDITABLE_KEYS.length - 1] });
     }
   }, [rows.length]);
@@ -156,22 +211,20 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
   const handleKeyDown = useCallback((e, rowIdx, col, task, getValue) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      skipBlurRef.current = true;
       saveField(task, col, getValue());
       if (rowIdx < rows.length - 1) setEditingCell({ rowIdx: rowIdx + 1, col });
       else { setEditingCell(null); createRow(rowIdx); }
     } else if (e.key === 'Tab') {
       e.preventDefault();
+      skipBlurRef.current = true;
       saveField(task, col, getValue());
       moveCell(rowIdx, col, e.shiftKey ? 'prev' : 'next');
     } else if (e.key === 'Escape') {
+      skipBlurRef.current = true;
       setEditingCell(null);
     }
   }, [rows.length, saveField, createRow, moveCell]);
-
-  const commitEdit = useCallback((task, col, value) => {
-    setEditingCell(null);
-    saveField(task, col, value);
-  }, [saveField]);
 
   const renderCell = (task, rowIdx, col) => {
     const isEdit = editingCell?.rowIdx === rowIdx && editingCell?.col === col;
@@ -181,11 +234,11 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     /* ── WBS number ── */
     if (col === 'wbs') return (
       <td key={col} className="wbs-grid-cell wbs-cell-wbs" style={{ width: w }}>
-        {rowIdx + 1}
+        {task._wbs}
       </td>
     );
 
-    /* ── Predecessors (read-only display) ── */
+    /* ── Predecessors (read-only) ── */
     if (col === 'predecessors') return (
       <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w }}>
         <span className="wbs-cell-val">{getPredecessorStr(task.id) || <span className="wbs-empty">—</span>}</span>
@@ -196,12 +249,18 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (col === 'assignee_id') {
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select ref={inputRef} className="wbs-cell-select"
+          <select
+            ref={inputRef}
+            className="wbs-cell-select"
             defaultValue={task.assignee_id || ''}
-            onChange={e => commitEdit(task, 'assignee_id', e.target.value ? Number(e.target.value) : null)}
-            onBlur={e    => commitEdit(task, 'assignee_id', e.target.value ? Number(e.target.value) : null)}
+            onChange={e => {
+              skipBlurRef.current = true;
+              saveField(task, 'assignee_id', e.target.value ? Number(e.target.value) : null);
+              setEditingCell(null);
+            }}
+            onBlur={() => { skipBlurRef.current = false; setEditingCell(null); }}
           >
-            <option value="">—</option>
+            <option value="">— Unassigned —</option>
             {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
           </select>
         </td>
@@ -218,10 +277,16 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (col === 'status') {
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select ref={inputRef} className="wbs-cell-select"
+          <select
+            ref={inputRef}
+            className="wbs-cell-select"
             defaultValue={task.status}
-            onChange={e => commitEdit(task, 'status', e.target.value)}
-            onBlur={e    => commitEdit(task, 'status', e.target.value)}
+            onChange={e => {
+              skipBlurRef.current = true;
+              saveField(task, 'status', e.target.value);
+              setEditingCell(null);
+            }}
+            onBlur={() => { skipBlurRef.current = false; setEditingCell(null); }}
           >
             {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -241,10 +306,16 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (col === 'priority') {
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select ref={inputRef} className="wbs-cell-select"
+          <select
+            ref={inputRef}
+            className="wbs-cell-select"
             defaultValue={task.priority}
-            onChange={e => commitEdit(task, 'priority', e.target.value)}
-            onBlur={e    => commitEdit(task, 'priority', e.target.value)}
+            onChange={e => {
+              skipBlurRef.current = true;
+              saveField(task, 'priority', e.target.value);
+              setEditingCell(null);
+            }}
+            onBlur={() => { skipBlurRef.current = false; setEditingCell(null); }}
           >
             {PRIORITY_OPTIONS.map(p => <option key={p} value={p}>{p}</option>)}
           </select>
@@ -264,10 +335,13 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (col === 'start_date' || col === 'due_date') {
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <input ref={inputRef} type="date" className="wbs-cell-input wbs-date-input-cell"
+          <input
+            ref={inputRef}
+            type="date"
+            className="wbs-cell-input wbs-date-input-cell"
             defaultValue={task[col] || ''}
-            onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => e.target.value)}
-            onBlur={e    => commitEdit(task, col, e.target.value || null)}
+            onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => e.target.value || null)}
+            onBlur={e    => handleBlur(task, col, e.target.value || null)}
           />
         </td>
       );
@@ -283,10 +357,15 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (col === 'estimated_days') {
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <input ref={inputRef} type="number" min="0" step="1" className="wbs-cell-input wbs-num-input"
+          <input
+            ref={inputRef}
+            type="number"
+            min="0"
+            step="1"
+            className="wbs-cell-input wbs-num-input"
             defaultValue={task.estimated_days || ''}
             onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => Number(e.target.value) || 0)}
-            onBlur={e    => commitEdit(task, col, Number(e.target.value) || 0)}
+            onBlur={e    => handleBlur(task, col, Number(e.target.value) || 0)}
           />
         </td>
       );
@@ -300,20 +379,31 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       );
     }
 
-    /* ── Title (text) ── */
+    /* ── Title — with subtask indent ── */
+    const indent = task._depth * 20;
     if (isEdit) return (
       <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-        <input ref={inputRef} className="wbs-cell-input"
+        <input
+          ref={inputRef}
+          className="wbs-cell-input"
+          style={{ paddingLeft: `${8 + indent}px` }}
           defaultValue={task[col] || ''}
           onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => e.target.value)}
-          onBlur={e    => commitEdit(task, col, e.target.value)}
+          onBlur={e    => handleBlur(task, col, e.target.value)}
         />
       </td>
     );
     return (
-      <td key={col} className={`wbs-grid-cell wbs-cell-text${saving.has(task.id) ? ' saving' : ''}`} style={{ width: w }}
-        onClick={() => setEditingCell({ rowIdx, col })}>
-        <span className="wbs-task-name-val" title={task[col]}>{task[col] || <span className="wbs-empty">—</span>}</span>
+      <td
+        key={col}
+        className={`wbs-grid-cell wbs-cell-text${saving.has(task.id) ? ' saving' : ''}`}
+        style={{ width: w }}
+        onClick={() => setEditingCell({ rowIdx, col })}
+      >
+        <span className="wbs-task-name-val" style={{ paddingLeft: `${indent}px` }} title={task[col]}>
+          {task._depth > 0 && <span className="wbs-subtask-arrow">↳ </span>}
+          {task[col] || <span className="wbs-empty">—</span>}
+        </span>
       </td>
     );
   };
@@ -322,9 +412,9 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     <div className="wbs-grid-wrap">
       <div className="wbs-grid-toolbar">
         <span className="wbs-grid-hint">
-          Click cell to edit · <kbd>Enter</kbd> save &amp; next row · <kbd>Tab</kbd> next cell · <kbd>Esc</kbd> cancel
+          Click cell to edit · <kbd>Enter</kbd> save &amp; next row · <kbd>Tab</kbd> next cell · <kbd>Esc</kbd> cancel · <kbd>Double-click</kbd> open detail
         </span>
-        <button className="btn-primary wbs-add-btn" onClick={() => createRow(rows.length - 1)}>
+        <button className="btn-primary wbs-add-btn" onClick={() => createRow(rows.length - 1, null)}>
           + Add Task
         </button>
       </div>
@@ -341,12 +431,25 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
           </thead>
           <tbody>
             {rows.map((task, rowIdx) => (
-              <tr key={task.id} className={`wbs-grid-row${rowIdx % 2 ? ' alt' : ''}${saving.has(task.id) ? ' saving' : ''}`}>
+              <tr
+                key={task.id}
+                className={[
+                  'wbs-grid-row',
+                  task._depth > 0 ? 'wbs-subtask-row' : '',
+                  rowIdx % 2 ? 'alt' : '',
+                  saving.has(task.id) ? 'saving' : '',
+                ].filter(Boolean).join(' ')}
+                onDoubleClick={() => onEditTask(task)}
+              >
                 {COLUMNS.map(c => renderCell(task, rowIdx, c.key))}
                 <td className="wbs-grid-cell wbs-cell-actions">
-                  <button className="wbs-action-btn" onClick={() => onEditTask(task)} title="Open full detail">⊞</button>
-                  <button className="wbs-action-btn wbs-action-add" onClick={() => createRow(rowIdx)} title="Insert row below">+</button>
-                  <button className="wbs-action-btn wbs-action-del" onClick={() => deleteRow(task)} title="Delete row">×</button>
+                  <button className="wbs-action-btn" onClick={e => { e.stopPropagation(); onEditTask(task); }} title="Open full detail">⊞</button>
+                  <button className="wbs-action-btn wbs-action-add"
+                    onClick={e => { e.stopPropagation(); createRow(rowIdx, task._depth > 0 ? task.parent_id : null); }}
+                    title="Insert row below">+</button>
+                  <button className="wbs-action-btn wbs-action-del"
+                    onClick={e => { e.stopPropagation(); deleteRow(task); }}
+                    title="Delete row">×</button>
                 </td>
               </tr>
             ))}
@@ -354,7 +457,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
               <tr>
                 <td colSpan={COLUMNS.length + 1} className="wbs-grid-empty">
                   No tasks yet.{' '}
-                  <button className="wbs-link-btn" onClick={() => createRow(-1)}>Add the first task</button>
+                  <button className="wbs-link-btn" onClick={() => createRow(-1, null)}>Add the first task</button>
                 </td>
               </tr>
             )}
