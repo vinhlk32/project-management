@@ -35,6 +35,10 @@ function daysBetween(startStr, endStr) {
   return Math.round((e - s) / 86400000) + 1;
 }
 
+function todayStr() {
+  return new Date().toISOString().split('T')[0];
+}
+
 // Resolve consistent (start, due, days) triple given which field the user changed.
 function resolveSchedule(task, field, rawValue) {
   let start = task.start_date || null;
@@ -43,7 +47,10 @@ function resolveSchedule(task, field, rawValue) {
 
   if (field === 'estimated_days') {
     days = Math.max(0, Number(rawValue) || 0);
-    if (days > 0 && start) due = addDays(start, days - 1);
+    if (days > 0) {
+      if (!start) start = todayStr();   // auto-fill Today when Start is blank
+      due = addDays(start, days - 1);
+    }
 
   } else if (field === 'start_date') {
     start = rawValue || null;
@@ -283,31 +290,47 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     skipBlurRef.current = true;
     saveField(task, col, draftValue);
 
+    // For schedule fields, compute the locally-resolved state so the next cell
+    // shows the correct projected value before the async API response arrives.
+    const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
+    let projectedTask = task;
+    if (scheduleFields.includes(col)) {
+      const resolved = resolveSchedule(task, col, draftValue);
+      if (!resolved.error) {
+        projectedTask = {
+          ...task,
+          start_date:     resolved.start,
+          due_date:       resolved.due,
+          estimated_days: resolved.days,
+        };
+      }
+    }
+
+    const seedFor = (t, key) => t[key] != null ? String(t[key]) : '';
+
     const colIdx = EDITABLE_KEYS.indexOf(col);
     if (direction === 'next') {
       if (colIdx < EDITABLE_KEYS.length - 1) {
-        const nextCol  = EDITABLE_KEYS[colIdx + 1];
-        const nextTask = visibleRows[rowIdx];
-        setDraftValue(nextTask[nextCol] != null ? String(nextTask[nextCol]) : '');
+        const nextCol = EDITABLE_KEYS[colIdx + 1];
+        setDraftValue(seedFor(projectedTask, nextCol));
         setEditingCell({ rowIdx, col: nextCol });
       } else if (rowIdx < visibleRows.length - 1) {
         const nextTask = visibleRows[rowIdx + 1];
         const nextCol  = EDITABLE_KEYS[0];
-        setDraftValue(nextTask[nextCol] != null ? String(nextTask[nextCol]) : '');
+        setDraftValue(seedFor(nextTask, nextCol));
         setEditingCell({ rowIdx: rowIdx + 1, col: nextCol });
       } else {
         setEditingCell(null);
       }
     } else {
       if (colIdx > 0) {
-        const prevCol  = EDITABLE_KEYS[colIdx - 1];
-        const prevTask = visibleRows[rowIdx];
-        setDraftValue(prevTask[prevCol] != null ? String(prevTask[prevCol]) : '');
+        const prevCol = EDITABLE_KEYS[colIdx - 1];
+        setDraftValue(seedFor(projectedTask, prevCol));
         setEditingCell({ rowIdx, col: prevCol });
       } else if (rowIdx > 0) {
         const prevTask = visibleRows[rowIdx - 1];
         const prevCol  = EDITABLE_KEYS[EDITABLE_KEYS.length - 1];
-        setDraftValue(prevTask[prevCol] != null ? String(prevTask[prevCol]) : '');
+        setDraftValue(seedFor(prevTask, prevCol));
         setEditingCell({ rowIdx: rowIdx - 1, col: prevCol });
       } else {
         setEditingCell(null);
@@ -323,6 +346,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       saveField(task, col, draftValue);
       if (rowIdx < visibleRows.length - 1) {
         const nextTask = visibleRows[rowIdx + 1];
+        // Use the same column key — next row's value is independent, read from rows
         setDraftValue(nextTask[col] != null ? String(nextTask[col]) : '');
         setEditingCell({ rowIdx: rowIdx + 1, col });
       } else {
