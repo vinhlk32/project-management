@@ -33,7 +33,7 @@ const PRIORITY_COLOR = { low: '#22c55e', medium: '#f59e0b', high: '#f97316', cri
 const toDate      = s    => new Date(s + 'T00:00:00');
 const daysBetween = (a, b) => Math.round((b - a) / 86_400_000);
 const addDays     = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
-const isoDate     = d    => d.toISOString().split('T')[0];
+const isoDate     = d    => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
 function fmtShort(dateStr) {
   if (!dateStr) return null;

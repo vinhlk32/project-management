@@ -19,11 +19,18 @@ const STATUS_COLORS    = { todo: '#6b7280', 'in-progress': '#f59e0b', done: '#22
 const PRIORITY_COLORS  = { low: '#22c55e', medium: '#f59e0b', high: '#f97316', critical: '#ef4444' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+function localDateStr(d) {
+  const y  = d.getFullYear();
+  const m  = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 function addDays(dateStr, n) {
   if (!dateStr) return '';
   const d = new Date(dateStr + 'T00:00:00');
   d.setDate(d.getDate() + n);
-  return d.toISOString().split('T')[0];
+  return localDateStr(d);
 }
 
 function daysBetween(startStr, endStr) {
@@ -35,7 +42,7 @@ function daysBetween(startStr, endStr) {
 }
 
 function todayStr() {
-  return new Date().toISOString().split('T')[0];
+  return localDateStr(new Date());
 }
 
 // Apply formula logic when one schedule field changes, return updated patch.
