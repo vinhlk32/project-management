@@ -27,6 +27,53 @@ function addDays(dateStr, n) {
   return d.toISOString().split('T')[0];
 }
 
+// Inclusive day count: daysBetween('2026-01-01', '2026-01-05') = 5
+function daysBetween(startStr, endStr) {
+  if (!startStr || !endStr) return 0;
+  const s = new Date(startStr + 'T00:00:00');
+  const e = new Date(endStr   + 'T00:00:00');
+  return Math.round((e - s) / 86400000) + 1;
+}
+
+// Resolve the consistent (start, due, days) triple given which field changed.
+// Returns { start, due, days, error } — error is set if due < start.
+function resolveSchedule(task, field, rawValue) {
+  let start = task.start_date || null;
+  let due   = task.due_date   || null;
+  let days  = task.estimated_days || 0;
+
+  if (field === 'estimated_days') {
+    days = Math.max(0, Number(rawValue) || 0);
+    if (days > 0 && start) due = addDays(start, days - 1);
+
+  } else if (field === 'start_date') {
+    start = rawValue || null;
+    if (days > 0 && start) {
+      // keep duration, shift finish forward
+      due = addDays(start, days - 1);
+    } else if (start && due) {
+      if (due < start) {
+        // clamp finish to start, duration becomes 1
+        due  = start;
+        days = 1;
+      } else {
+        days = daysBetween(start, due);
+      }
+    }
+
+  } else if (field === 'due_date') {
+    due = rawValue || null;
+    if (due && start) {
+      if (due < start) {
+        return { start, due: task.due_date, days, error: 'Finish date cannot be before start date' };
+      }
+      days = daysBetween(start, due);
+    }
+  }
+
+  return { start, due, days, error: null };
+}
+
 // Build flat list: top-level tasks with subtasks inserted after their parent,
 // each row gets _depth (0 = top-level) and _wbs ("1", "1.1", "2", etc.)
 function buildRows(allTasks) {
@@ -55,6 +102,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
   const [deps, setDeps]               = useState([]);
   const [editingCell, setEditingCell] = useState(null); // { rowIdx, col }
   const [saving, setSaving]           = useState(new Set());
+  const [cellError, setCellError]     = useState(null); // { rowIdx, col, msg }
   const inputRef    = useRef(null);
   const skipBlurRef = useRef(false); // prevent double-save when keyboard commit fires blur
 
@@ -107,11 +155,30 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     });
   }, []);
 
-  // Core save: PUT task, then apply affected (successor date propagation)
+  // Core save: resolve (start, due, days) triple → PUT → apply affected successors
   const saveField = useCallback(async (task, field, value) => {
-    // Skip no-op saves
-    if (task[field] === value) return;
+    // Skip no-op saves (string/number compare; coerce to string for safety)
+    if (String(task[field] ?? '') === String(value ?? '')) return;
 
+    // For schedule fields, resolve the consistent triple first
+    const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
+    let resolvedStart = task.start_date || null;
+    let resolvedDue   = task.due_date   || null;
+    let resolvedDays  = task.estimated_days || 0;
+
+    if (scheduleFields.includes(field)) {
+      const resolved = resolveSchedule(task, field, value);
+      if (resolved.error) {
+        setCellError({ rowIdx: null, col: field, msg: resolved.error });
+        setTimeout(() => setCellError(null), 3000);
+        return;
+      }
+      resolvedStart = resolved.start;
+      resolvedDue   = resolved.due;
+      resolvedDays  = resolved.days;
+    }
+
+    setCellError(null);
     setSaving(prev => new Set(prev).add(task.id));
 
     const body = {
@@ -121,18 +188,14 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       priority:        task.priority,
       assignee_id:     task.assignee_id || null,
       labels:          task.labels || '',
-      start_date:      task.start_date || null,
-      due_date:        task.due_date || null,
+      start_date:      resolvedStart,
+      due_date:        resolvedDue,
       estimated_hours: task.estimated_hours || 0,
-      estimated_days:  task.estimated_days  || 0,
+      estimated_days:  resolvedDays,
       logged_hours:    task.logged_hours || 0,
-      [field]: value,
+      // non-schedule fields override directly
+      ...(scheduleFields.includes(field) ? {} : { [field]: value }),
     };
-
-    // Auto-compute due_date when days or start_date changes
-    const days  = field === 'estimated_days' ? Number(value)    : (task.estimated_days || 0);
-    const start = field === 'start_date'     ? (value || null)  : task.start_date;
-    if (days > 0 && start) body.due_date = addDays(start, days - 1);
 
     try {
       const res = await authFetch(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
@@ -418,6 +481,10 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
           + Add Task
         </button>
       </div>
+
+      {cellError && (
+        <div className="wbs-cell-error">⚠ {cellError.msg}</div>
+      )}
 
       <div className="wbs-grid-scroll">
         <table className="wbs-grid-table">

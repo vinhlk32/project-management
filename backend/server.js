@@ -427,9 +427,13 @@ app.put('/api/tasks/:id', async (req, res) => {
     if (estH < 0 || estH > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
     if (logH < 0 || logH > 9999) return res.status(400).json({ error: 'Invalid logged_hours' });
 
-    // If estimated_days set and start_date provided, auto-compute due_date
-    const finalDue = (estD > 0 && start_date) ? addDays(start_date, estD - 1) : (due_date || null);
+    // Validate start/due ordering
+    if (start_date && due_date && due_date < start_date) {
+      return res.status(400).json({ error: 'Finish date cannot be before start date' });
+    }
 
+    // Trust the frontend to have resolved (start_date, due_date, estimated_days) consistently.
+    // Do not auto-override here so that direct due_date edits are preserved.
     await db.execute({
       sql: `UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?,
             assignee_id = ?, labels = ?, start_date = ?, due_date = ?,
@@ -439,7 +443,7 @@ app.put('/api/tasks/:id', async (req, res) => {
         title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
         assignee_id || null, (labels || '').slice(0, 500),
-        start_date || null, finalDue,
+        start_date || null, due_date || null,
         estH, estD, logH,
         req.params.id,
       ],
