@@ -1,25 +1,25 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 
-const COLUMNS = [
+const COLUMN_DEFS = [
   { key: 'wbs',            label: '#',            width: 60,  editable: false },
   { key: 'title',          label: 'Task Name',    width: 240, editable: true  },
-  { key: 'estimated_days', label: 'Days',         width: 60,  editable: true  },
-  { key: 'start_date',     label: 'Start',        width: 110, editable: true  },
-  { key: 'due_date',       label: 'Finish',       width: 110, editable: true  },
+  { key: 'estimated_days', label: 'Days',         width: 70,  editable: true  },
+  { key: 'start_date',     label: 'Start',        width: 120, editable: true  },
+  { key: 'due_date',       label: 'Finish',       width: 120, editable: true  },
   { key: 'predecessors',   label: 'Predecessors', width: 110, editable: false },
   { key: 'assignee_id',    label: 'Assignee',     width: 130, editable: true  },
   { key: 'status',         label: 'Status',       width: 110, editable: true  },
   { key: 'priority',       label: 'Priority',     width: 100, editable: true  },
 ];
 
-const EDITABLE_KEYS = COLUMNS.filter(c => c.editable).map(c => c.key);
-
+const EDITABLE_KEYS  = COLUMN_DEFS.filter(c => c.editable).map(c => c.key);
 const STATUS_OPTIONS   = ['todo', 'in-progress', 'done'];
 const PRIORITY_OPTIONS = ['low', 'medium', 'high', 'critical'];
 const STATUS_COLORS    = { todo: '#6b7280', 'in-progress': '#f59e0b', done: '#22c55e' };
 const PRIORITY_COLORS  = { low: '#22c55e', medium: '#f59e0b', high: '#f97316', critical: '#ef4444' };
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function addDays(dateStr, n) {
   if (!dateStr) return null;
   const d = new Date(dateStr + 'T00:00:00');
@@ -27,7 +27,7 @@ function addDays(dateStr, n) {
   return d.toISOString().split('T')[0];
 }
 
-// Inclusive day count: daysBetween('2026-01-01', '2026-01-05') = 5
+// Inclusive: daysBetween('2026-01-01','2026-01-05') = 5
 function daysBetween(startStr, endStr) {
   if (!startStr || !endStr) return 0;
   const s = new Date(startStr + 'T00:00:00');
@@ -35,8 +35,7 @@ function daysBetween(startStr, endStr) {
   return Math.round((e - s) / 86400000) + 1;
 }
 
-// Resolve the consistent (start, due, days) triple given which field changed.
-// Returns { start, due, days, error } — error is set if due < start.
+// Resolve consistent (start, due, days) triple given which field the user changed.
 function resolveSchedule(task, field, rawValue) {
   let start = task.start_date || null;
   let due   = task.due_date   || null;
@@ -49,33 +48,24 @@ function resolveSchedule(task, field, rawValue) {
   } else if (field === 'start_date') {
     start = rawValue || null;
     if (days > 0 && start) {
-      // keep duration, shift finish forward
-      due = addDays(start, days - 1);
+      due = addDays(start, days - 1);           // keep duration, shift finish
     } else if (start && due) {
-      if (due < start) {
-        // clamp finish to start, duration becomes 1
-        due  = start;
-        days = 1;
-      } else {
-        days = daysBetween(start, due);
-      }
+      if (due < start) { due = start; days = 1; }
+      else days = daysBetween(start, due);
     }
 
   } else if (field === 'due_date') {
     due = rawValue || null;
     if (due && start) {
-      if (due < start) {
-        return { start, due: task.due_date, days, error: 'Finish date cannot be before start date' };
-      }
-      days = daysBetween(start, due);
+      if (due < start) return { start, due: task.due_date, days, error: 'Finish date cannot be before start date' };
+      days = daysBetween(start, due);           // Days = Finish - Start + 1
     }
   }
 
   return { start, due, days, error: null };
 }
 
-// Build flat list: top-level tasks with subtasks inserted after their parent,
-// each row gets _depth (0 = top-level) and _wbs ("1", "1.1", "2", etc.)
+// Build flat DFS list with _depth and _wbs
 function buildRows(allTasks) {
   const byParent = {};
   allTasks.forEach(t => {
@@ -83,7 +73,6 @@ function buildRows(allTasks) {
     if (!byParent[key]) byParent[key] = [];
     byParent[key].push(t);
   });
-
   const result = [];
   function walk(parentKey, depth, parentWbs) {
     (byParent[parentKey] || []).forEach((task, idx) => {
@@ -96,21 +85,30 @@ function buildRows(allTasks) {
   return result;
 }
 
+// ── Component ─────────────────────────────────────────────────────────────────
 export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksChange, onEditTask }) {
   const { authFetch } = useAuth();
-  const [rows, setRows]               = useState([]);
-  const [deps, setDeps]               = useState([]);
-  const [editingCell, setEditingCell] = useState(null); // { rowIdx, col }
-  const [saving, setSaving]           = useState(new Set());
-  const [cellError, setCellError]     = useState(null); // { rowIdx, col, msg }
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  const [rows,        setRows]        = useState([]);
+  const [deps,        setDeps]        = useState([]);
+  const [editingCell, setEditingCell] = useState(null);  // { rowIdx, col }
+  const [draftValue,  setDraftValue]  = useState('');    // controlled input value
+  const [saving,      setSaving]      = useState(new Set());
+  const [cellError,   setCellError]   = useState(null);
+  const [collapsed,   setCollapsed]   = useState(new Set()); // parent IDs with hidden children
+  const [colWidths,   setColWidths]   = useState(
+    () => Object.fromEntries(COLUMN_DEFS.map(c => [c.key, c.width]))
+  );
+
   const inputRef    = useRef(null);
-  const skipBlurRef = useRef(false); // prevent double-save when keyboard commit fires blur
+  const skipBlurRef = useRef(false);
+  const resizeRef   = useRef(null); // { key, startX, startWidth }
 
-  // Rebuild flat tree whenever allTasks changes
-  useEffect(() => {
-    setRows(buildRows(allTasks));
-  }, [allTasks]);
+  // ── Rebuild rows from allTasks ─────────────────────────────────────────────
+  useEffect(() => { setRows(buildRows(allTasks)); }, [allTasks]);
 
+  // ── Load project dependencies ──────────────────────────────────────────────
   useEffect(() => {
     authFetch(`/api/projects/${project.id}/dependencies`)
       .then(r => r.ok ? r.json() : [])
@@ -118,7 +116,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       .catch(() => {});
   }, [project.id]);
 
-  // Auto-focus input when editing cell changes
+  // ── Auto-focus & select on cell open ──────────────────────────────────────
   useEffect(() => {
     if (editingCell && inputRef.current) {
       inputRef.current.focus();
@@ -126,7 +124,41 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     }
   }, [editingCell]);
 
-  // Map task id → wbs string for predecessor display
+  // ── Resize: global mouse handlers ─────────────────────────────────────────
+  useEffect(() => {
+    const onMouseMove = (e) => {
+      if (!resizeRef.current) return;
+      const { key, startX, startWidth } = resizeRef.current;
+      const newWidth = Math.max(40, startWidth + e.clientX - startX);
+      setColWidths(prev => ({ ...prev, [key]: newWidth }));
+    };
+    const onMouseUp = () => { resizeRef.current = null; };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup',   onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup',   onMouseUp);
+    };
+  }, []);
+
+  // ── Derived: parent IDs that have children ────────────────────────────────
+  const parentIds = useMemo(
+    () => new Set(rows.filter(r => r.parent_id).map(r => r.parent_id)),
+    [rows]
+  );
+
+  // ── Derived: visible rows after applying collapsed state ──────────────────
+  const visibleRows = useMemo(() => {
+    const hiddenIds = new Set();
+    rows.forEach(r => {
+      if (r.parent_id && (collapsed.has(r.parent_id) || hiddenIds.has(r.parent_id))) {
+        hiddenIds.add(r.id);
+      }
+    });
+    return rows.filter(r => !hiddenIds.has(r.id));
+  }, [rows, collapsed]);
+
+  // ── Predecessor display string ─────────────────────────────────────────────
   const wbsByTaskId = useMemo(() => {
     const map = {};
     rows.forEach(r => { map[r.id] = r._wbs; });
@@ -147,6 +179,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       .join(', ');
   }, [deps, wbsByTaskId]);
 
+  // ── Apply affected (propagated) rows ──────────────────────────────────────
   const applyAffected = useCallback((affected, baseRows) => {
     if (!affected?.length) return baseRows;
     return baseRows.map(r => {
@@ -155,22 +188,35 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     });
   }, []);
 
-  // Core save: resolve (start, due, days) triple → PUT → apply affected successors
-  const saveField = useCallback(async (task, field, value) => {
-    // Skip no-op saves (string/number compare; coerce to string for safety)
-    if (String(task[field] ?? '') === String(value ?? '')) return;
+  // ── Open cell for editing ──────────────────────────────────────────────────
+  const openCell = useCallback((rowIdx, col, task) => {
+    let initial = '';
+    if (col === 'assignee_id')    initial = task.assignee_id  != null ? String(task.assignee_id) : '';
+    else if (col === 'status')    initial = task.status   || 'todo';
+    else if (col === 'priority')  initial = task.priority || 'medium';
+    else if (col === 'estimated_days') initial = task.estimated_days != null ? String(task.estimated_days) : '';
+    else                          initial = task[col] != null ? String(task[col]) : '';
+    setDraftValue(initial);
+    setEditingCell({ rowIdx, col });
+  }, []);
 
-    // For schedule fields, resolve the consistent triple first
+  // ── Core save ─────────────────────────────────────────────────────────────
+  const saveField = useCallback(async (task, col, value) => {
+    // No-op check
+    const currentStr = String(task[col] ?? '');
+    const valueStr   = String(value ?? '');
+    if (currentStr === valueStr) return;
+
     const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
     let resolvedStart = task.start_date || null;
     let resolvedDue   = task.due_date   || null;
     let resolvedDays  = task.estimated_days || 0;
 
-    if (scheduleFields.includes(field)) {
-      const resolved = resolveSchedule(task, field, value);
+    if (scheduleFields.includes(col)) {
+      const resolved = resolveSchedule(task, col, value);
       if (resolved.error) {
-        setCellError({ rowIdx: null, col: field, msg: resolved.error });
-        setTimeout(() => setCellError(null), 3000);
+        setCellError(resolved.error);
+        setTimeout(() => setCellError(null), 3500);
         return;
       }
       resolvedStart = resolved.start;
@@ -180,6 +226,12 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
 
     setCellError(null);
     setSaving(prev => new Set(prev).add(task.id));
+
+    const coercedValue = col === 'assignee_id'
+      ? (value ? Number(value) : null)
+      : col === 'estimated_days'
+        ? (Number(value) || 0)
+        : value;
 
     const body = {
       title:           task.title,
@@ -193,132 +245,174 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       estimated_hours: task.estimated_hours || 0,
       estimated_days:  resolvedDays,
       logged_hours:    task.logged_hours || 0,
-      // non-schedule fields override directly
-      ...(scheduleFields.includes(field) ? {} : { [field]: value }),
+      ...(scheduleFields.includes(col) ? {} : { [col]: coercedValue }),
     };
 
     try {
       const res = await authFetch(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
-      if (!res.ok) return;
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (err.error) { setCellError(err.error); setTimeout(() => setCellError(null), 3500); }
+        return;
+      }
       const { task: updated, affected } = await res.json();
 
-      // Update rows (preserves _depth / _wbs metadata) + propagate affected successors
       setRows(prev => {
         const next = prev.map(r => r.id === updated.id ? { ...r, ...updated } : r);
         return applyAffected(affected, next);
       });
-
-      // Propagate up to TaskList so other views stay in sync
       onTasksChange?.(prev => {
         const next = prev.map(t => t.id === updated.id ? { ...t, ...updated } : t);
         if (!affected?.length) return next;
-        return next.map(t => {
-          const a = affected.find(x => x.id === t.id);
-          return a ? { ...t, ...a } : t;
-        });
+        return next.map(t => { const a = affected.find(x => x.id === t.id); return a ? { ...t, ...a } : t; });
       });
     } finally {
       setSaving(prev => { const s = new Set(prev); s.delete(task.id); return s; });
     }
   }, [authFetch, applyAffected, onTasksChange]);
 
-  // Blur handler — skipped when keyboard (Enter/Tab/Esc) already handled the commit
-  const handleBlur = useCallback((task, col, value) => {
-    if (skipBlurRef.current) {
-      skipBlurRef.current = false;
-      return;
-    }
+  // ── Commit current draft and close cell ───────────────────────────────────
+  const commitAndClose = useCallback((task, col) => {
+    skipBlurRef.current = true;
     setEditingCell(null);
-    saveField(task, col, value);
-  }, [saveField]);
+    saveField(task, col, draftValue);
+  }, [saveField, draftValue]);
 
+  // ── Move to adjacent cell (Tab / Enter navigation) ────────────────────────
+  const moveCell = useCallback((task, col, rowIdx, direction) => {
+    skipBlurRef.current = true;
+    saveField(task, col, draftValue);
+
+    const colIdx = EDITABLE_KEYS.indexOf(col);
+    if (direction === 'next') {
+      if (colIdx < EDITABLE_KEYS.length - 1) {
+        const nextCol  = EDITABLE_KEYS[colIdx + 1];
+        const nextTask = visibleRows[rowIdx];
+        setDraftValue(nextTask[nextCol] != null ? String(nextTask[nextCol]) : '');
+        setEditingCell({ rowIdx, col: nextCol });
+      } else if (rowIdx < visibleRows.length - 1) {
+        const nextTask = visibleRows[rowIdx + 1];
+        const nextCol  = EDITABLE_KEYS[0];
+        setDraftValue(nextTask[nextCol] != null ? String(nextTask[nextCol]) : '');
+        setEditingCell({ rowIdx: rowIdx + 1, col: nextCol });
+      } else {
+        setEditingCell(null);
+      }
+    } else {
+      if (colIdx > 0) {
+        const prevCol  = EDITABLE_KEYS[colIdx - 1];
+        const prevTask = visibleRows[rowIdx];
+        setDraftValue(prevTask[prevCol] != null ? String(prevTask[prevCol]) : '');
+        setEditingCell({ rowIdx, col: prevCol });
+      } else if (rowIdx > 0) {
+        const prevTask = visibleRows[rowIdx - 1];
+        const prevCol  = EDITABLE_KEYS[EDITABLE_KEYS.length - 1];
+        setDraftValue(prevTask[prevCol] != null ? String(prevTask[prevCol]) : '');
+        setEditingCell({ rowIdx: rowIdx - 1, col: prevCol });
+      } else {
+        setEditingCell(null);
+      }
+    }
+  }, [saveField, draftValue, visibleRows]);
+
+  const handleKeyDown = useCallback((e, task, col, rowIdx) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      // Enter: save + move down same column
+      skipBlurRef.current = true;
+      saveField(task, col, draftValue);
+      if (rowIdx < visibleRows.length - 1) {
+        const nextTask = visibleRows[rowIdx + 1];
+        setDraftValue(nextTask[col] != null ? String(nextTask[col]) : '');
+        setEditingCell({ rowIdx: rowIdx + 1, col });
+      } else {
+        setEditingCell(null);
+        createRow(rowIdx, null);
+      }
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      moveCell(task, col, rowIdx, e.shiftKey ? 'prev' : 'next');
+    } else if (e.key === 'Escape') {
+      skipBlurRef.current = true;
+      setEditingCell(null);
+    }
+  }, [saveField, draftValue, visibleRows, moveCell]);
+
+  const handleBlur = useCallback((task, col) => {
+    if (skipBlurRef.current) { skipBlurRef.current = false; return; }
+    setEditingCell(null);
+    saveField(task, col, draftValue);
+  }, [saveField, draftValue]);
+
+  // ── Row CRUD ───────────────────────────────────────────────────────────────
   const createRow = useCallback(async (afterIdx, parentId = null) => {
     const res = await authFetch('/api/tasks', {
       method: 'POST',
-      body: JSON.stringify({
-        project_id: project.id,
-        title: 'New Task',
-        status: 'todo',
-        priority: 'medium',
-        parent_id: parentId,
-      }),
+      body: JSON.stringify({ project_id: project.id, title: 'New Task', status: 'todo', priority: 'medium', parent_id: parentId }),
     });
     if (!res.ok) return;
     const newTask = await res.json();
-    // Let allTasks update via onTasksChange → useEffect will rebuild rows
     onTasksChange?.(prev => [...prev, newTask]);
-    setEditingCell({ rowIdx: afterIdx + 1, col: 'title' });
+    // setEditingCell after rows rebuild via useEffect
+    setTimeout(() => {
+      setEditingCell({ rowIdx: afterIdx + 1, col: 'title' });
+      setDraftValue('New Task');
+    }, 50);
   }, [authFetch, project.id, onTasksChange]);
 
   const deleteRow = useCallback(async (task) => {
     if (!window.confirm(`Delete "${task.title}"?`)) return;
     const res = await authFetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
-    if (res.ok) {
-      // Remove task and any of its subtasks from parent state
-      onTasksChange?.(prev => prev.filter(t => t.id !== task.id && t.parent_id !== task.id));
-    }
+    if (res.ok) onTasksChange?.(prev => prev.filter(t => t.id !== task.id && t.parent_id !== task.id));
   }, [authFetch, onTasksChange]);
 
-  const moveCell = useCallback((rowIdx, col, direction) => {
-    const colIdx = EDITABLE_KEYS.indexOf(col);
-    if (direction === 'next') {
-      if (colIdx < EDITABLE_KEYS.length - 1) setEditingCell({ rowIdx, col: EDITABLE_KEYS[colIdx + 1] });
-      else if (rowIdx < rows.length - 1)     setEditingCell({ rowIdx: rowIdx + 1, col: EDITABLE_KEYS[0] });
-      else                                   setEditingCell(null);
-    } else {
-      if (colIdx > 0)      setEditingCell({ rowIdx, col: EDITABLE_KEYS[colIdx - 1] });
-      else if (rowIdx > 0) setEditingCell({ rowIdx: rowIdx - 1, col: EDITABLE_KEYS[EDITABLE_KEYS.length - 1] });
-    }
-  }, [rows.length]);
+  const toggleCollapse = useCallback((taskId) => {
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  }, []);
 
-  const handleKeyDown = useCallback((e, rowIdx, col, task, getValue) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      skipBlurRef.current = true;
-      saveField(task, col, getValue());
-      if (rowIdx < rows.length - 1) setEditingCell({ rowIdx: rowIdx + 1, col });
-      else { setEditingCell(null); createRow(rowIdx); }
-    } else if (e.key === 'Tab') {
-      e.preventDefault();
-      skipBlurRef.current = true;
-      saveField(task, col, getValue());
-      moveCell(rowIdx, col, e.shiftKey ? 'prev' : 'next');
-    } else if (e.key === 'Escape') {
-      skipBlurRef.current = true;
-      setEditingCell(null);
-    }
-  }, [rows.length, saveField, createRow, moveCell]);
-
+  // ── Render one cell ────────────────────────────────────────────────────────
   const renderCell = (task, rowIdx, col) => {
     const isEdit = editingCell?.rowIdx === rowIdx && editingCell?.col === col;
-    const colDef = COLUMNS.find(c => c.key === col);
-    const w      = colDef.width;
+    const w      = colWidths[col];
 
-    /* ── WBS number ── */
-    if (col === 'wbs') return (
-      <td key={col} className="wbs-grid-cell wbs-cell-wbs" style={{ width: w }}>
-        {task._wbs}
-      </td>
-    );
+    // ── WBS + collapse toggle ──
+    if (col === 'wbs') {
+      const hasChildren = parentIds.has(task.id);
+      const isCollapsed = collapsed.has(task.id);
+      return (
+        <td key={col} className="wbs-grid-cell wbs-cell-wbs" style={{ width: w, minWidth: w }}>
+          {hasChildren ? (
+            <button className="wbs-collapse-btn" onClick={() => toggleCollapse(task.id)} title={isCollapsed ? 'Expand' : 'Collapse'}>
+              {isCollapsed ? '▶' : '▼'}
+            </button>
+          ) : null}
+          <span className="wbs-num">{task._wbs}</span>
+        </td>
+      );
+    }
 
-    /* ── Predecessors (read-only) ── */
+    // ── Predecessors (read-only) ──
     if (col === 'predecessors') return (
-      <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w }}>
+      <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w, minWidth: w }}>
         <span className="wbs-cell-val">{getPredecessorStr(task.id) || <span className="wbs-empty">—</span>}</span>
       </td>
     );
 
-    /* ── Assignee select ── */
+    // ── Assignee select ──
     if (col === 'assignee_id') {
       if (isEdit) return (
-        <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select
-            ref={inputRef}
-            className="wbs-cell-select"
-            defaultValue={task.assignee_id || ''}
+        <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+          <select ref={inputRef} className="wbs-cell-select"
+            value={draftValue}
             onChange={e => {
+              setDraftValue(e.target.value);
               skipBlurRef.current = true;
-              saveField(task, 'assignee_id', e.target.value ? Number(e.target.value) : null);
+              saveField(task, 'assignee_id', e.target.value);
               setEditingCell(null);
             }}
             onBlur={() => { skipBlurRef.current = false; setEditingCell(null); }}
@@ -329,22 +423,21 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         </td>
       );
       return (
-        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w }}
-          onClick={() => setEditingCell({ rowIdx, col })}>
+        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w, minWidth: w }}
+          onClick={() => openCell(rowIdx, col, task)}>
           <span className="wbs-cell-val">{task.assignee_name || <span className="wbs-empty">—</span>}</span>
         </td>
       );
     }
 
-    /* ── Status select ── */
+    // ── Status select ──
     if (col === 'status') {
       if (isEdit) return (
-        <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select
-            ref={inputRef}
-            className="wbs-cell-select"
-            defaultValue={task.status}
+        <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+          <select ref={inputRef} className="wbs-cell-select"
+            value={draftValue}
             onChange={e => {
+              setDraftValue(e.target.value);
               skipBlurRef.current = true;
               saveField(task, 'status', e.target.value);
               setEditingCell(null);
@@ -356,8 +449,8 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         </td>
       );
       return (
-        <td key={col} className="wbs-grid-cell" style={{ width: w }}
-          onClick={() => setEditingCell({ rowIdx, col })}>
+        <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}
+          onClick={() => openCell(rowIdx, col, task)}>
           <span className="wbs-status-chip" style={{ background: STATUS_COLORS[task.status] + '22', color: STATUS_COLORS[task.status] }}>
             {task.status}
           </span>
@@ -365,15 +458,14 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       );
     }
 
-    /* ── Priority select ── */
+    // ── Priority select ──
     if (col === 'priority') {
       if (isEdit) return (
-        <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <select
-            ref={inputRef}
-            className="wbs-cell-select"
-            defaultValue={task.priority}
+        <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+          <select ref={inputRef} className="wbs-cell-select"
+            value={draftValue}
             onChange={e => {
+              setDraftValue(e.target.value);
               skipBlurRef.current = true;
               saveField(task, 'priority', e.target.value);
               setEditingCell(null);
@@ -385,8 +477,8 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         </td>
       );
       return (
-        <td key={col} className="wbs-grid-cell" style={{ width: w }}
-          onClick={() => setEditingCell({ rowIdx, col })}>
+        <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}
+          onClick={() => openCell(rowIdx, col, task)}>
           <span className="wbs-priority-chip" style={{ color: PRIORITY_COLORS[task.priority] }}>
             {task.priority}
           </span>
@@ -394,113 +486,107 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       );
     }
 
-    /* ── Date inputs ── */
+    // ── Date inputs ──
     if (col === 'start_date' || col === 'due_date') {
       if (isEdit) return (
-        <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <input
-            key={task[col] || ''}
-            ref={inputRef}
-            type="date"
-            className="wbs-cell-input wbs-date-input-cell"
-            defaultValue={task[col] || ''}
-            onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => e.target.value || null)}
-            onBlur={e    => handleBlur(task, col, e.target.value || null)}
+        <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+          <input ref={inputRef} type="date" className="wbs-cell-input wbs-date-input-cell"
+            value={draftValue}
+            onChange={e => setDraftValue(e.target.value)}
+            onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
+            onBlur={() => handleBlur(task, col)}
           />
         </td>
       );
       return (
-        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w }}
-          onClick={() => setEditingCell({ rowIdx, col })}>
+        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w, minWidth: w }}
+          onClick={() => openCell(rowIdx, col, task)}>
           <span className={`wbs-cell-val${!task[col] ? ' wbs-empty' : ''}`}>{task[col] || '—'}</span>
         </td>
       );
     }
 
-    /* ── Estimated days ── */
+    // ── Estimated days ──
     if (col === 'estimated_days') {
       if (isEdit) return (
-        <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-          <input
-            key={String(task.estimated_days ?? '')}
-            ref={inputRef}
-            type="number"
-            min="0"
-            step="1"
-            className="wbs-cell-input wbs-num-input"
-            defaultValue={task.estimated_days || ''}
-            onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => Number(e.target.value) || 0)}
-            onBlur={e    => handleBlur(task, col, Number(e.target.value) || 0)}
+        <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+          <input ref={inputRef} type="number" min="0" step="1" className="wbs-cell-input wbs-num-input"
+            value={draftValue}
+            onChange={e => setDraftValue(e.target.value)}
+            onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
+            onBlur={() => handleBlur(task, col)}
           />
         </td>
       );
       return (
-        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w }}
-          onClick={() => setEditingCell({ rowIdx, col })}>
-          <span className={`wbs-cell-val${!task.estimated_days ? ' wbs-empty' : ''}`}>
+        <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w, minWidth: w }}
+          onClick={() => openCell(rowIdx, col, task)}>
+          <span className={`wbs-cell-val wbs-num-val${!task.estimated_days ? ' wbs-empty' : ''}`}>
             {task.estimated_days || '—'}
           </span>
         </td>
       );
     }
 
-    /* ── Title — with subtask indent ── */
+    // ── Title (with indent + collapse arrow) ──
     const indent = task._depth * 20;
     if (isEdit) return (
-      <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
-        <input
-          key={task.title || ''}
-          ref={inputRef}
-          className="wbs-cell-input"
+      <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
+        <input ref={inputRef} className="wbs-cell-input"
           style={{ paddingLeft: `${8 + indent}px` }}
-          defaultValue={task[col] || ''}
-          onKeyDown={e => handleKeyDown(e, rowIdx, col, task, () => e.target.value)}
-          onBlur={e    => handleBlur(task, col, e.target.value)}
+          value={draftValue}
+          onChange={e => setDraftValue(e.target.value)}
+          onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
+          onBlur={() => handleBlur(task, col)}
         />
       </td>
     );
     return (
-      <td
-        key={col}
-        className={`wbs-grid-cell wbs-cell-text${saving.has(task.id) ? ' saving' : ''}`}
-        style={{ width: w }}
-        onClick={() => setEditingCell({ rowIdx, col })}
-      >
-        <span className="wbs-task-name-val" style={{ paddingLeft: `${indent}px` }} title={task[col]}>
+      <td key={col} className={`wbs-grid-cell wbs-cell-text${saving.has(task.id) ? ' saving' : ''}`}
+        style={{ width: w, minWidth: w }}
+        onClick={() => openCell(rowIdx, col, task)}>
+        <span className="wbs-task-name-val" style={{ paddingLeft: `${indent}px` }} title={task.title}>
           {task._depth > 0 && <span className="wbs-subtask-arrow">↳ </span>}
-          {task[col] || <span className="wbs-empty">—</span>}
+          {task.title || <span className="wbs-empty">—</span>}
         </span>
       </td>
     );
   };
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="wbs-grid-wrap">
       <div className="wbs-grid-toolbar">
         <span className="wbs-grid-hint">
-          Click cell to edit · <kbd>Enter</kbd> save &amp; next row · <kbd>Tab</kbd> next cell · <kbd>Esc</kbd> cancel · <kbd>Double-click</kbd> open detail
+          Click cell · <kbd>Enter</kbd> next row · <kbd>Tab</kbd> next cell · <kbd>Esc</kbd> cancel · Double-click row = full detail
         </span>
-        <button className="btn-primary wbs-add-btn" onClick={() => createRow(rows.length - 1, null)}>
+        <button className="btn-primary wbs-add-btn" onClick={() => createRow(visibleRows.length - 1, null)}>
           + Add Task
         </button>
       </div>
 
-      {cellError && (
-        <div className="wbs-cell-error">⚠ {cellError.msg}</div>
-      )}
+      {cellError && <div className="wbs-cell-error">⚠ {cellError}</div>}
 
       <div className="wbs-grid-scroll">
         <table className="wbs-grid-table">
           <thead>
             <tr className="wbs-grid-head-row">
-              {COLUMNS.map(c => (
-                <th key={c.key} className="wbs-grid-th" style={{ width: c.width, minWidth: c.width }}>{c.label}</th>
+              {COLUMN_DEFS.map(c => (
+                <th key={c.key} className="wbs-grid-th" style={{ width: colWidths[c.key], minWidth: colWidths[c.key] }}>
+                  <span className="wbs-th-label">{c.label}</span>
+                  <span className="wbs-resize-handle"
+                    onMouseDown={e => {
+                      e.preventDefault();
+                      resizeRef.current = { key: c.key, startX: e.clientX, startWidth: colWidths[c.key] };
+                    }}
+                  />
+                </th>
               ))}
               <th className="wbs-grid-th wbs-grid-th-actions">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((task, rowIdx) => (
+            {visibleRows.map((task, rowIdx) => (
               <tr
                 key={task.id}
                 className={[
@@ -511,23 +597,22 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
                 ].filter(Boolean).join(' ')}
                 onDoubleClick={() => onEditTask(task)}
               >
-                {COLUMNS.map(c => renderCell(task, rowIdx, c.key))}
+                {COLUMN_DEFS.map(c => renderCell(task, rowIdx, c.key))}
                 <td className="wbs-grid-cell wbs-cell-actions">
-                  <button className="wbs-action-btn" onClick={e => { e.stopPropagation(); onEditTask(task); }} title="Open full detail">⊞</button>
+                  <button className="wbs-action-btn" onClick={e => { e.stopPropagation(); onEditTask(task); }} title="Open detail">⊞</button>
                   <button className="wbs-action-btn wbs-action-add"
                     onClick={e => { e.stopPropagation(); createRow(rowIdx, task._depth > 0 ? task.parent_id : null); }}
                     title="Insert row below">+</button>
                   <button className="wbs-action-btn wbs-action-del"
                     onClick={e => { e.stopPropagation(); deleteRow(task); }}
-                    title="Delete row">×</button>
+                    title="Delete">×</button>
                 </td>
               </tr>
             ))}
-            {rows.length === 0 && (
+            {visibleRows.length === 0 && (
               <tr>
-                <td colSpan={COLUMNS.length + 1} className="wbs-grid-empty">
-                  No tasks yet.{' '}
-                  <button className="wbs-link-btn" onClick={() => createRow(-1, null)}>Add the first task</button>
+                <td colSpan={COLUMN_DEFS.length + 1} className="wbs-grid-empty">
+                  No tasks yet. <button className="wbs-link-btn" onClick={() => createRow(-1, null)}>Add the first task</button>
                 </td>
               </tr>
             )}

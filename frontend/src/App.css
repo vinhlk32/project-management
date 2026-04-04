@@ -2850,3 +2850,67 @@ body {
   padding: 6px 12px;
   flex-shrink: 0;
 }
+
+/* ── WBS column resize handle ────────────────────────────────────────────── */
+.wbs-grid-th {
+  position: relative;
+}
+
+.wbs-th-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 10px;
+}
+
+.wbs-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 1;
+}
+
+.wbs-resize-handle:hover {
+  background: #4a9eff;
+}
+
+/* ── WBS collapse toggle ─────────────────────────────────────────────────── */
+.wbs-collapse-btn {
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 9px;
+  padding: 0 3px 0 0;
+  cursor: pointer;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.wbs-collapse-btn:hover {
+  color: #4a9eff;
+}
+
+.wbs-num {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.wbs-cell-wbs {
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* ── Days number alignment ───────────────────────────────────────────────── */
+.wbs-num-val {
+  text-align: right;
+  display: block;
+  font-variant-numeric: tabular-nums;
+}
