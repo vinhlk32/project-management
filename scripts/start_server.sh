@@ -46,7 +46,7 @@ done
 
 # Swap Nginx upstream — ~1ms zero-downtime
 echo "▶ Swapping Nginx upstream to :$NEXT_PORT..."
-sudo sed -i "s|server 127.0.0.1:[0-9]*; # prod|server 127.0.0.1:$NEXT_PORT; # prod|" \
+sudo sed -i "s|proxy_pass http://127.0.0.1:[0-9]*; # prod|proxy_pass http://127.0.0.1:$NEXT_PORT; # prod|" \
   /etc/nginx/conf.d/pmapp-prod.conf
 sudo nginx -t
 sudo nginx -s reload
