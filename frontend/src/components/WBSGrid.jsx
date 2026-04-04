@@ -100,7 +100,9 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
   const [rows,        setRows]        = useState([]);
   const [deps,        setDeps]        = useState([]);
   const [editingCell, setEditingCell] = useState(null);  // { rowIdx, col }
-  const [draftValue,  setDraftValue]  = useState('');    // controlled input value
+  const [draftValue,  setDraftValue]  = useState('');    // controlled input value (drives input UI)
+  // setDraft keeps draftRef always in sync so stale closures read the latest value
+  const setDraft = useCallback((v) => { draftRef.current = v; setDraftValue(v); }, []);
   const [saving,      setSaving]      = useState(new Set());
   const [cellError,   setCellError]   = useState(null);
   const [collapsed,   setCollapsed]   = useState(new Set()); // parent IDs with hidden children
@@ -108,9 +110,11 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     () => Object.fromEntries(COLUMN_DEFS.map(c => [c.key, c.width]))
   );
 
-  const inputRef    = useRef(null);
-  const skipBlurRef = useRef(false);
-  const resizeRef   = useRef(null); // { key, startX, startWidth }
+  const inputRef       = useRef(null);
+  const skipBlurRef    = useRef(false);
+  const resizeRef      = useRef(null);       // { key, startX, startWidth }
+  const projectedRef   = useRef(null);       // accumulated resolved schedule while tabbing same row
+  const draftRef       = useRef('');         // always-current draft value (avoids stale closure)
 
   // ── Rebuild rows from allTasks ─────────────────────────────────────────────
   useEffect(() => { setRows(buildRows(allTasks)); }, [allTasks]);
@@ -197,22 +201,25 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
 
   // ── Open cell for editing ──────────────────────────────────────────────────
   const openCell = useCallback((rowIdx, col, task) => {
+    // Reset projection when user clicks directly into a cell (not from Tab)
+    projectedRef.current = null;
+    const src = projectedRef.current || task;
     let initial = '';
-    if (col === 'assignee_id')    initial = task.assignee_id  != null ? String(task.assignee_id) : '';
-    else if (col === 'status')    initial = task.status   || 'todo';
-    else if (col === 'priority')  initial = task.priority || 'medium';
+    if (col === 'assignee_id')         initial = task.assignee_id  != null ? String(task.assignee_id) : '';
+    else if (col === 'status')         initial = task.status   || 'todo';
+    else if (col === 'priority')       initial = task.priority || 'medium';
     else if (col === 'estimated_days') initial = task.estimated_days != null ? String(task.estimated_days) : '';
-    else                          initial = task[col] != null ? String(task[col]) : '';
-    setDraftValue(initial);
+    else                               initial = task[col] != null ? String(task[col]) : '';
+    void src; // projectedRef was just reset, src === null, use task directly
+    setDraft(initial);
     setEditingCell({ rowIdx, col });
   }, []);
 
   // ── Core save ─────────────────────────────────────────────────────────────
   const saveField = useCallback(async (task, col, value) => {
-    // No-op check
-    const currentStr = String(task[col] ?? '');
-    const valueStr   = String(value ?? '');
-    if (currentStr === valueStr) return;
+    // No-op check: treat null/undefined/"" as equivalent
+    const normalize = v => (v == null ? '' : String(v));
+    if (normalize(task[col]) === normalize(value)) return;
 
     const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
     let resolvedStart = task.start_date || null;
@@ -282,72 +289,84 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
   const commitAndClose = useCallback((task, col) => {
     skipBlurRef.current = true;
     setEditingCell(null);
-    saveField(task, col, draftValue);
-  }, [saveField, draftValue]);
+    saveField(task, col, draftRef.current);
+  }, [saveField]);
 
   // ── Move to adjacent cell (Tab / Enter navigation) ────────────────────────
   const moveCell = useCallback((task, col, rowIdx, direction) => {
     skipBlurRef.current = true;
-    saveField(task, col, draftValue);
+    const current = draftRef.current; // read ref — always latest value, never stale
 
-    // For schedule fields, compute the locally-resolved state so the next cell
-    // shows the correct projected value before the async API response arrives.
+    // Use accumulated projection if we are still on the same row, else start fresh
+    const baseTask = (projectedRef.current?.id === task.id) ? projectedRef.current : task;
+
+    // Resolve and accumulate schedule projection so subsequent cells see updated values
     const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
-    let projectedTask = task;
     if (scheduleFields.includes(col)) {
-      const resolved = resolveSchedule(task, col, draftValue);
+      const resolved = resolveSchedule(baseTask, col, current);
       if (!resolved.error) {
-        projectedTask = {
-          ...task,
+        projectedRef.current = {
+          ...baseTask,
           start_date:     resolved.start,
           due_date:       resolved.due,
           estimated_days: resolved.days,
         };
       }
+    } else {
+      projectedRef.current = { ...baseTask, [col]: current };
     }
 
-    const seedFor = (t, key) => t[key] != null ? String(t[key]) : '';
+    // Save using the base task state (server resolves from the full body)
+    saveField(baseTask, col, current);
+
+    const projected = projectedRef.current || baseTask;
+    const seedFor = (t, key) => (t[key] != null && t[key] !== '') ? String(t[key]) : '';
 
     const colIdx = EDITABLE_KEYS.indexOf(col);
     if (direction === 'next') {
       if (colIdx < EDITABLE_KEYS.length - 1) {
         const nextCol = EDITABLE_KEYS[colIdx + 1];
-        setDraftValue(seedFor(projectedTask, nextCol));
+        // Moving to a different row? reset projection
+        setDraft(seedFor(projected, nextCol));
         setEditingCell({ rowIdx, col: nextCol });
       } else if (rowIdx < visibleRows.length - 1) {
+        projectedRef.current = null; // new row, reset
         const nextTask = visibleRows[rowIdx + 1];
         const nextCol  = EDITABLE_KEYS[0];
-        setDraftValue(seedFor(nextTask, nextCol));
+        setDraft(seedFor(nextTask, nextCol));
         setEditingCell({ rowIdx: rowIdx + 1, col: nextCol });
       } else {
+        projectedRef.current = null;
         setEditingCell(null);
       }
     } else {
       if (colIdx > 0) {
         const prevCol = EDITABLE_KEYS[colIdx - 1];
-        setDraftValue(seedFor(projectedTask, prevCol));
+        setDraft(seedFor(projected, prevCol));
         setEditingCell({ rowIdx, col: prevCol });
       } else if (rowIdx > 0) {
+        projectedRef.current = null;
         const prevTask = visibleRows[rowIdx - 1];
         const prevCol  = EDITABLE_KEYS[EDITABLE_KEYS.length - 1];
-        setDraftValue(seedFor(prevTask, prevCol));
+        setDraft(seedFor(prevTask, prevCol));
         setEditingCell({ rowIdx: rowIdx - 1, col: prevCol });
       } else {
+        projectedRef.current = null;
         setEditingCell(null);
       }
     }
-  }, [saveField, draftValue, visibleRows]);
+  }, [saveField, visibleRows]);
 
   const handleKeyDown = useCallback((e, task, col, rowIdx) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       // Enter: save + move down same column
       skipBlurRef.current = true;
-      saveField(task, col, draftValue);
+      saveField(task, col, draftRef.current);
       if (rowIdx < visibleRows.length - 1) {
         const nextTask = visibleRows[rowIdx + 1];
         // Use the same column key — next row's value is independent, read from rows
-        setDraftValue(nextTask[col] != null ? String(nextTask[col]) : '');
+        setDraft(nextTask[col] != null ? String(nextTask[col]) : '');
         setEditingCell({ rowIdx: rowIdx + 1, col });
       } else {
         setEditingCell(null);
@@ -360,13 +379,13 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       skipBlurRef.current = true;
       setEditingCell(null);
     }
-  }, [saveField, draftValue, visibleRows, moveCell]);
+  }, [saveField, visibleRows, moveCell, createRow]);
 
   const handleBlur = useCallback((task, col) => {
     if (skipBlurRef.current) { skipBlurRef.current = false; return; }
     setEditingCell(null);
-    saveField(task, col, draftValue);
-  }, [saveField, draftValue]);
+    saveField(task, col, draftRef.current);
+  }, [saveField]);
 
   // ── Row CRUD ───────────────────────────────────────────────────────────────
   const createRow = useCallback(async (afterIdx, parentId = null) => {
@@ -380,7 +399,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     // setEditingCell after rows rebuild via useEffect
     setTimeout(() => {
       setEditingCell({ rowIdx: afterIdx + 1, col: 'title' });
-      setDraftValue('New Task');
+      setDraft('New Task');
     }, 50);
   }, [authFetch, project.id, onTasksChange]);
 
@@ -516,7 +535,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
           <input ref={inputRef} type="date" className="wbs-cell-input wbs-date-input-cell"
             value={draftValue}
-            onChange={e => setDraftValue(e.target.value)}
+            onChange={e => setDraft(e.target.value)}
             onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
             onBlur={() => handleBlur(task, col)}
           />
@@ -536,7 +555,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         <td key={col} className="wbs-grid-cell editing" style={{ width: w, minWidth: w }}>
           <input ref={inputRef} type="number" min="0" step="1" className="wbs-cell-input wbs-num-input"
             value={draftValue}
-            onChange={e => setDraftValue(e.target.value)}
+            onChange={e => setDraft(e.target.value)}
             onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
             onBlur={() => handleBlur(task, col)}
           />
@@ -559,7 +578,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         <input ref={inputRef} className="wbs-cell-input"
           style={{ paddingLeft: `${8 + indent}px` }}
           value={draftValue}
-          onChange={e => setDraftValue(e.target.value)}
+          onChange={e => setDraft(e.target.value)}
           onKeyDown={e => handleKeyDown(e, task, col, rowIdx)}
           onBlur={() => handleBlur(task, col)}
         />
