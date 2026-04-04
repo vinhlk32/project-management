@@ -30,7 +30,7 @@ docker run -d \
 # Health check — 18 × 5s = 90s max
 echo "▶ Health checking on :$NEXT_PORT..."
 for i in $(seq 1 18); do
-  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEXT_PORT/api/health)
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEXT_PORT/api/health 2>/dev/null || echo "000")
   if [ "$STATUS" = "200" ]; then
     echo "✅ Healthy (attempt $i)"
     break
