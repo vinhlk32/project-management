@@ -23,23 +23,26 @@ function toMySQLDatetime(date) {
 function setCookies(res, accessToken, refreshToken, csrfToken) {
   const accessExpiry = new Date(Date.now() + 15 * 60 * 1000);
   const refreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  // Cross-origin SPA+API: frontend and backend are on different CloudFront domains,
+  // so cookies must use sameSite: 'None' (requires Secure). CSRF header still protects mutations.
+  const sameSite = IS_PROD ? 'None' : 'Lax';
 
   res.cookie('access_token', accessToken, {
     httpOnly: true,
     secure: IS_PROD,
-    sameSite: 'Strict',
+    sameSite,
     expires: accessExpiry,
   });
   res.cookie('refresh_token', refreshToken, {
     httpOnly: true,
     secure: IS_PROD,
-    sameSite: 'Strict',
+    sameSite,
     expires: refreshExpiry,
   });
   res.cookie('csrf_token', csrfToken, {
     httpOnly: false,
     secure: IS_PROD,
-    sameSite: 'Strict',
+    sameSite,
     expires: accessExpiry,
   });
 }
