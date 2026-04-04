@@ -169,39 +169,41 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
 
   const isDirty = (taskId) => taskId in drafts;
 
-  // Update a single field in the draft, applying formula for schedule fields
-  const updateDraft = useCallback((task, field, value) => {
+  // Update a single field in the draft, applying formula for schedule fields.
+  // Not memoized — always fresh, no stale-closure risk.
+  const updateDraft = (task, field, value) => {
     const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
     setErrors(prev => { const n = { ...prev }; delete n[task.id]; return n; });
 
     if (scheduleFields.includes(field)) {
-      // Build current draft state for this task
-      const current = {
-        estimated_days: val(task, 'estimated_days'),
-        start_date:     val(task, 'start_date'),
-        due_date:       val(task, 'due_date'),
-        ...drafts[task.id],
-      };
-      const result = applyScheduleFormula(current, field, value);
-      if (result.error) {
-        setErrors(prev => ({ ...prev, [task.id]: result.error }));
-        // Still update the field the user typed, just don't apply the formula
-        setDrafts(prev => ({ ...prev, [task.id]: { ...prev[task.id], [field]: value } }));
-        return;
-      }
-      setDrafts(prev => ({
-        ...prev,
-        [task.id]: {
-          ...prev[task.id],
-          estimated_days: result.estimated_days,
-          start_date:     result.start_date,
-          due_date:       result.due_date,
-        },
-      }));
+      setDrafts(prev => {
+        // Build current schedule from LATEST prev state (never stale)
+        const existing = prev[task.id] || {};
+        const current = {
+          estimated_days: existing.estimated_days ?? String(task.estimated_days ?? ''),
+          start_date:     existing.start_date     ?? (task.start_date || ''),
+          due_date:       existing.due_date       ?? (task.due_date   || ''),
+        };
+        const result = applyScheduleFormula(current, field, value);
+        if (result.error) {
+          // Store error but still record what the user typed
+          setTimeout(() => setErrors(e => ({ ...e, [task.id]: result.error })), 0);
+          return { ...prev, [task.id]: { ...existing, [field]: value } };
+        }
+        return {
+          ...prev,
+          [task.id]: {
+            ...existing,
+            estimated_days: result.estimated_days,
+            start_date:     result.start_date,
+            due_date:       result.due_date,
+          },
+        };
+      });
     } else {
       setDrafts(prev => ({ ...prev, [task.id]: { ...prev[task.id], [field]: value } }));
     }
-  }, [drafts]);
+  };
 
   const discardDraft = useCallback((taskId) => {
     setDrafts(prev => { const n = { ...prev }; delete n[taskId]; return n; });
