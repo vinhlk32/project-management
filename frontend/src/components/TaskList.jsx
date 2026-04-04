@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import TaskModal from './TaskModal';
 import GanttChart from './GanttChart';
+import WBSGrid from './WBSGrid';
 import ConflictAlert from './ConflictAlert';
 import { useAuth } from '../context/AuthContext';
 
@@ -117,6 +118,7 @@ export default function TaskList({ project, users = [], currentUser: currentUser
         start_date:      task.start_date || null,
         due_date:        task.due_date || null,
         estimated_hours: task.estimated_hours || 0,
+        estimated_days:  task.estimated_days  || 0,
         logged_hours:    task.logged_hours || 0,
         [field]:         value || null,
       }),
@@ -191,12 +193,9 @@ export default function TaskList({ project, users = [], currentUser: currentUser
             </button>
           )}
           <div className="view-toggle">
-            <button className={`view-btn${view === 'kanban' ? ' active' : ''}`} onClick={() => setView('kanban')}>
-              Kanban
-            </button>
-            <button className={`view-btn${view === 'gantt' ? ' active' : ''}`} onClick={() => setView('gantt')}>
-              Gantt
-            </button>
+            <button className={`view-btn${view === 'kanban' ? ' active' : ''}`} onClick={() => setView('kanban')}>Kanban</button>
+            <button className={`view-btn${view === 'wbs'    ? ' active' : ''}`} onClick={() => setView('wbs')}>WBS</button>
+            <button className={`view-btn${view === 'gantt'  ? ' active' : ''}`} onClick={() => setView('gantt')}>Gantt</button>
           </div>
           <button className="btn-primary" onClick={openNew}>+ New Task</button>
         </div>
@@ -346,6 +345,17 @@ export default function TaskList({ project, users = [], currentUser: currentUser
             </div>
           ))}
         </div>
+      )}
+
+      {view === 'wbs' && (
+        <WBSGrid
+          project={project}
+          tasks={tasks}
+          users={users}
+          currentUser={currentUser}
+          onTasksChange={setTasks}
+          onEditTask={openEdit}
+        />
       )}
 
       {view === 'gantt' && (

@@ -52,7 +52,9 @@ async function propagateDates(db, changedTaskId, visited = new Set()) {
     if (!successor) continue;
 
     const lag = dep.lag || 0;
-    const duration = daysBetween(successor.start_date, successor.due_date);
+    const duration = (successor.estimated_days > 0)
+      ? successor.estimated_days - 1
+      : daysBetween(successor.start_date, successor.due_date);
 
     let newStart = successor.start_date;
     let newDue = successor.due_date;
@@ -60,9 +62,9 @@ async function propagateDates(db, changedTaskId, visited = new Set()) {
 
     switch (dep.type) {
       case 'FS': {
-        // successor must start after predecessor finishes
+        // successor must start the day after predecessor finishes (+1)
         if (predecessor.due_date) {
-          const minStart = addDays(predecessor.due_date, lag);
+          const minStart = addDays(predecessor.due_date, lag + 1);
           if (!newStart || newStart < minStart) {
             newStart = minStart;
             newDue = duration !== null ? addDays(newStart, duration) : newDue;
@@ -126,4 +128,4 @@ async function propagateDates(db, changedTaskId, visited = new Set()) {
   return updated;
 }
 
-module.exports = { propagateDates };
+module.exports = { propagateDates, addDays };

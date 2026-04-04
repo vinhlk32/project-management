@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const { db, initializeDatabase, cleanupExpiredTokens } = require('./db');
-const { propagateDates } = require('./propagate');
+const { propagateDates, addDays } = require('./propagate');
 const requireAuth = require('./middleware/requireAuth');
 const requireRole = require('./middleware/requireRole');
 const authRoutes = require('./routes/authRoutes');
@@ -324,7 +324,7 @@ app.get('/api/projects/:id/tasks', async (req, res) => {
 
 app.post('/api/tasks', async (req, res) => {
   try {
-    const { project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, parent_id, dependencies } = req.body;
+    const { project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, parent_id, dependencies } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
     if (title.trim().length > 300) return res.status(400).json({ error: 'Title too long (max 300)' });
     if (description && description.length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
@@ -335,16 +335,21 @@ app.post('/api/tasks', async (req, res) => {
     if (parent_id && !isValidId(parent_id)) return res.status(400).json({ error: 'Invalid parent_id' });
     const hours = Number(estimated_hours) || 0;
     if (hours < 0 || hours > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
+    const eDays = Math.max(0, Math.min(9999, Number(estimated_days) || 0));
+
+    // Auto-calculate due_date from start_date + estimated_days if not explicitly provided
+    let calcDue = due_date || null;
+    if (eDays > 0 && start_date && !due_date) calcDue = addDays(start_date, eDays - 1);
 
     const result = await db.execute({
-      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, parent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         project_id, title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
         assignee_id || null, (labels || '').slice(0, 500),
-        start_date || null, due_date || null,
-        hours, parent_id || null,
+        start_date || null, calcDue,
+        hours, eDays, parent_id || null,
       ],
     });
 
@@ -364,6 +369,24 @@ app.post('/api/tasks', async (req, res) => {
           });
         } catch (depErr) {
           if (!depErr.message?.includes('UNIQUE')) throw depErr;
+        }
+      }
+
+      // Auto-calculate start/due from FS predecessors when estimated_days is set
+      if (eDays > 0 && !start_date) {
+        const fsDeps = dependencies.filter(d => (d.type || 'FS') === 'FS');
+        let latestDue = null; let latestLag = 0;
+        for (const dep of fsDeps) {
+          const r = await db.execute({ sql: 'SELECT due_date FROM tasks WHERE id = ?', args: [Number(dep.predecessor_id)] });
+          const pred = r.rows[0];
+          if (pred?.due_date && (!latestDue || pred.due_date > latestDue)) {
+            latestDue = pred.due_date; latestLag = dep.lag || 0;
+          }
+        }
+        if (latestDue) {
+          const autoStart = addDays(latestDue, latestLag + 1);
+          const autoDue   = addDays(autoStart, eDays - 1);
+          await db.execute({ sql: 'UPDATE tasks SET start_date = ?, due_date = ? WHERE id = ?', args: [autoStart, autoDue, taskId] });
         }
       }
     }
@@ -391,7 +414,7 @@ app.post('/api/tasks', async (req, res) => {
 
 app.put('/api/tasks/:id', async (req, res) => {
   try {
-    const { title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, logged_hours } = req.body;
+    const { title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, logged_hours } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
     if (title.trim().length > 300) return res.status(400).json({ error: 'Title too long (max 300)' });
     if (description && description.length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
@@ -399,21 +422,25 @@ app.put('/api/tasks/:id', async (req, res) => {
     if (priority && !VALID_PRIORITIES.includes(priority)) return res.status(400).json({ error: 'Invalid priority' });
     if (assignee_id && !isValidId(assignee_id)) return res.status(400).json({ error: 'Invalid assignee_id' });
     const estH = Number(estimated_hours) || 0;
+    const estD = Math.max(0, Math.min(9999, Number(estimated_days) || 0));
     const logH = Number(logged_hours) || 0;
     if (estH < 0 || estH > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
     if (logH < 0 || logH > 9999) return res.status(400).json({ error: 'Invalid logged_hours' });
 
+    // If estimated_days set and start_date provided, auto-compute due_date
+    const finalDue = (estD > 0 && start_date) ? addDays(start_date, estD - 1) : (due_date || null);
+
     await db.execute({
       sql: `UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?,
             assignee_id = ?, labels = ?, start_date = ?, due_date = ?,
-            estimated_hours = ?, logged_hours = ?
+            estimated_hours = ?, estimated_days = ?, logged_hours = ?
             WHERE id = ?`,
       args: [
         title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
         assignee_id || null, (labels || '').slice(0, 500),
-        start_date || null, due_date || null,
-        estH, logH,
+        start_date || null, finalDue,
+        estH, estD, logH,
         req.params.id,
       ],
     });
