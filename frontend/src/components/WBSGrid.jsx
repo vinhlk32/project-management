@@ -399,6 +399,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
           <input
+            key={task[col] || ''}
             ref={inputRef}
             type="date"
             className="wbs-cell-input wbs-date-input-cell"
@@ -421,6 +422,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       if (isEdit) return (
         <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
           <input
+            key={String(task.estimated_days ?? '')}
             ref={inputRef}
             type="number"
             min="0"
@@ -447,6 +449,7 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     if (isEdit) return (
       <td key={col} className="wbs-grid-cell editing" style={{ width: w }}>
         <input
+          key={task.title || ''}
           ref={inputRef}
           className="wbs-cell-input"
           style={{ paddingLeft: `${8 + indent}px` }}
