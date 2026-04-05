@@ -79,6 +79,7 @@ export default function TaskModal({
   const [estimatedHours, setEstimatedHours] = useState(task?.estimated_hours || '');
   const [estimatedDays, setEstimatedDays]   = useState(task?.estimated_days  || '');
   const [loggedHours, setLoggedHours] = useState(task?.logged_hours || '');
+  const [notes, setNotes] = useState(task?.notes || '');
 
   // Dependencies for existing task (fetched from API)
   const [deps, setDeps] = useState([]);
@@ -145,6 +146,7 @@ export default function TaskModal({
       priority,
       assignee_id: assigneeId ? Number(assigneeId) : null,
       labels: labels.join(','),
+      notes: notes.slice(0, 200),
       start_date: startDate || null,
       due_date: dueDate || null,
       estimated_hours: estimatedHours ? Number(estimatedHours) : 0,
@@ -436,6 +438,17 @@ export default function TaskModal({
                   />
                 </div>
               )}
+            </div>
+
+            <div className="form-field">
+              <label>Notes <span className="label-hint">({notes.length}/200)</span></label>
+              <input
+                type="text"
+                value={notes}
+                onChange={e => setNotes(e.target.value.slice(0, 200))}
+                maxLength={200}
+                placeholder="Short note…"
+              />
             </div>
 
             {/* ── Dependencies section for new task creation ── */}

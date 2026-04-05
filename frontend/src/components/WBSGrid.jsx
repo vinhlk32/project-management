@@ -3,27 +3,21 @@ import { useAuth } from '../context/AuthContext';
 
 const COLUMN_DEFS = [
   { key: 'wbs',            label: '#',            width: 60,  editable: false },
-  { key: 'title',          label: 'Task Name',    width: 240, editable: true  },
-  { key: 'estimated_days', label: 'Days',         width: 70,  editable: true  },
-  { key: 'start_date',     label: 'Start',        width: 120, editable: true  },
-  { key: 'due_date',       label: 'Finish',       width: 120, editable: true  },
-  { key: 'predecessors',   label: 'Predecessors', width: 110, editable: false },
+  { key: 'title',          label: 'Task Name',    width: 220, editable: true  },
+  { key: 'estimated_days', label: 'Days',         width: 60,  editable: true  },
+  { key: 'start_date',     label: 'Start',        width: 110, editable: true  },
+  { key: 'due_date',       label: 'Finish',       width: 110, editable: true  },
+  { key: 'predecessors',   label: 'Predecessors', width: 110, editable: true  },
   { key: 'assignee_id',    label: 'Assignee',     width: 130, editable: true  },
   { key: 'status',         label: 'Status',       width: 110, editable: true  },
-  { key: 'priority',       label: 'Priority',     width: 100, editable: true  },
+  { key: 'notes',          label: 'Notes',        width: 180, editable: true  },
 ];
 
-const STATUS_OPTIONS   = ['todo', 'in-progress', 'done'];
-const PRIORITY_OPTIONS = ['low', 'medium', 'high', 'critical'];
-const STATUS_COLORS    = { todo: '#6b7280', 'in-progress': '#f59e0b', done: '#22c55e' };
-const PRIORITY_COLORS  = { low: '#22c55e', medium: '#f59e0b', high: '#f97316', critical: '#ef4444' };
+const STATUS_OPTIONS = ['todo', 'in-progress', 'done'];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function localDateStr(d) {
-  const y  = d.getFullYear();
-  const m  = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${dd}`;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
 function addDays(dateStr, n) {
@@ -33,20 +27,15 @@ function addDays(dateStr, n) {
   return localDateStr(d);
 }
 
-function daysBetween(startStr, endStr) {
-  if (!startStr || !endStr) return '';
-  const s = new Date(startStr + 'T00:00:00');
-  const e = new Date(endStr   + 'T00:00:00');
-  const n = Math.round((e - s) / 86400000) + 1;
+function daysBetween(a, b) {
+  if (!a || !b) return '';
+  const n = Math.round((new Date(b+'T00:00:00') - new Date(a+'T00:00:00')) / 86400000) + 1;
   return n > 0 ? String(n) : '';
 }
 
-function todayStr() {
-  return localDateStr(new Date());
-}
+function todayStr() { return localDateStr(new Date()); }
 
 // Apply formula logic when one schedule field changes, return updated patch.
-// All values are strings (as stored in drafts).
 function applyScheduleFormula(current, field, value) {
   let days  = field === 'estimated_days' ? value : (current.estimated_days ?? '');
   let start = field === 'start_date'     ? value : (current.start_date     ?? '');
@@ -56,12 +45,12 @@ function applyScheduleFormula(current, field, value) {
 
   if (field === 'estimated_days') {
     if (daysNum > 0) {
-      if (!start) start = todayStr();               // auto-fill today
+      if (!start) start = todayStr();
       due = addDays(start, daysNum - 1);
     }
   } else if (field === 'start_date') {
     if (daysNum > 0 && start) {
-      due = addDays(start, daysNum - 1);            // preserve duration, shift finish
+      due = addDays(start, daysNum - 1);
     } else if (start && due) {
       if (due < start) { due = start; days = '1'; }
       else days = daysBetween(start, due);
@@ -69,11 +58,109 @@ function applyScheduleFormula(current, field, value) {
   } else if (field === 'due_date') {
     if (due && start) {
       if (due < start) return { error: 'Finish date cannot be before start date' };
-      days = daysBetween(start, due);               // Days = Finish − Start + 1
+      days = daysBetween(start, due);
     }
   }
 
   return { estimated_days: days, start_date: start, due_date: due, error: null };
+}
+
+// Parse "3FS, 5FF+2, 3FS-1" → [{wbs:'3',type:'FS',lag:0}, ...]
+function parsePredecessors(str) {
+  if (!str?.trim()) return [];
+  return str.split(',').map(s => {
+    s = s.trim();
+    const m = s.match(/^([\d.]+)(FS|FF|SS|SF)?([+-]\d+)?$/i);
+    if (!m) return null;
+    return { wbs: m[1], type: (m[2] || 'FS').toUpperCase(), lag: m[3] ? parseInt(m[3]) : 0 };
+  }).filter(Boolean);
+}
+
+// Format deps array → display string using wbsByTaskId map
+function formatPredecessors(taskId, deps, wbsByTaskId) {
+  return deps
+    .filter(d => d.successor_id === taskId)
+    .map(d => {
+      const wbs = wbsByTaskId[d.predecessor_id];
+      if (!wbs) return null;
+      const type = (d.type && d.type !== 'FS') ? d.type : '';
+      const lag  = d.lag ? (d.lag > 0 ? `+${d.lag}` : `${d.lag}`) : '';
+      return `${wbs}${type}${lag}`;
+    })
+    .filter(Boolean).join(', ');
+}
+
+// Compute new dates for a successor given predecessor dates, dep type, lag, and successor duration
+function computeSuccessorDates(predStart, predFinish, depType, lag, succDays) {
+  const days = Number(succDays) || 1;
+  let start, finish;
+  if (depType === 'FS' || !depType) {
+    start  = addDays(predFinish, lag + 1);
+    finish = addDays(start, days - 1);
+  } else if (depType === 'SS') {
+    start  = addDays(predStart, lag);
+    finish = addDays(start, days - 1);
+  } else if (depType === 'FF') {
+    finish = addDays(predFinish, lag);
+    start  = addDays(finish, -(days - 1));
+  } else if (depType === 'SF') {
+    finish = addDays(predStart, lag);
+    start  = addDays(finish, -(days - 1));
+  }
+  return { start, finish };
+}
+
+// Cascade date changes from one task to all its successors (draft only).
+function cascadeDraftDates(changedId, changedStart, changedFinish, allRows, allDeps, drafts, visited = new Set()) {
+  if (visited.has(changedId)) return drafts;
+  visited.add(changedId);
+  let newDrafts = { ...drafts };
+
+  const successorDeps = allDeps.filter(d => d.predecessor_id === changedId);
+  for (const dep of successorDeps) {
+    const succ = allRows.find(r => r.id === dep.successor_id);
+    if (!succ) continue;
+    const succDraft = newDrafts[succ.id] || {};
+    const succDays  = succDraft.estimated_days ?? String(succ.estimated_days || 1);
+    const { start, finish } = computeSuccessorDates(changedStart, changedFinish, dep.type, dep.lag || 0, succDays);
+    if (!start || !finish) continue;
+    newDrafts[succ.id] = { ...succDraft, start_date: start, due_date: finish, estimated_days: String(daysBetween(start, finish)) };
+    newDrafts = cascadeDraftDates(succ.id, start, finish, allRows, allDeps, newDrafts, visited);
+  }
+  return newDrafts;
+}
+
+// Rollup parent dates from subtasks, then cascade parent's successors.
+function rollupParent(changedTaskId, allRows, allDeps, drafts) {
+  const task = allRows.find(r => r.id === changedTaskId);
+  if (!task || !task.parent_id) return drafts;
+  const parent = allRows.find(r => r.id === task.parent_id);
+  if (!parent) return drafts;
+
+  const siblings = allRows.filter(r => r.parent_id === parent.id);
+  const starts = [], finishes = [];
+  for (const s of siblings) {
+    const d = drafts[s.id] || {};
+    const st = d.start_date ?? s.start_date;
+    const fi = d.due_date   ?? s.due_date;
+    if (st) starts.push(st);
+    if (fi) finishes.push(fi);
+  }
+
+  let newDrafts = { ...drafts };
+  const minStart  = starts.length  ? starts.sort()[0]            : '';
+  const maxFinish = finishes.length ? finishes.sort().reverse()[0] : '';
+  const pDays     = (minStart && maxFinish) ? daysBetween(minStart, maxFinish) : '';
+
+  const pDraft = newDrafts[parent.id] || {};
+  newDrafts[parent.id] = { ...pDraft, start_date: minStart, due_date: maxFinish, estimated_days: pDays };
+
+  // Cascade parent's change to its successors
+  if (minStart && maxFinish) {
+    newDrafts = cascadeDraftDates(parent.id, minStart, maxFinish, allRows, allDeps, newDrafts);
+  }
+  // Recurse: if parent is also a subtask, rollup grandparent
+  return rollupParent(parent.id, allRows, allDeps, newDrafts);
 }
 
 // Build flat DFS list with _depth and _wbs
@@ -102,10 +189,9 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
 
   const [rows,      setRows]      = useState([]);
   const [deps,      setDeps]      = useState([]);
-  // drafts[taskId] = { field: value, ... } — local edits not yet saved
   const [drafts,    setDrafts]    = useState({});
   const [saving,    setSaving]    = useState(new Set());
-  const [errors,    setErrors]    = useState({});  // { taskId: msg }
+  const [errors,    setErrors]    = useState({});
   const [collapsed, setCollapsed] = useState(new Set());
   const [colWidths, setColWidths] = useState(
     () => Object.fromEntries(COLUMN_DEFS.map(c => [c.key, c.width]))
@@ -152,39 +238,52 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     const m = {}; rows.forEach(r => { m[r.id] = r._wbs; }); return m;
   }, [rows]);
 
-  const getPredecessorStr = useCallback((taskId) => {
-    return deps
-      .filter(d => d.successor_id === taskId)
-      .map(d => {
-        const wbs = wbsByTaskId[d.predecessor_id];
-        if (!wbs) return null;
-        const suffix = d.type && d.type !== 'FS' ? d.type : '';
-        const lag    = d.lag ? (d.lag > 0 ? `+${d.lag}` : `${d.lag}`) : '';
-        return `${wbs}${suffix}${lag}`;
-      })
-      .filter(Boolean).join(', ');
-  }, [deps, wbsByTaskId]);
-
   // ── Draft helpers ─────────────────────────────────────────────────────────
-  // Get display value for a field: draft first, then saved
   const val = (task, field) => {
     const d = drafts[task.id];
     if (d && field in d) return d[field] ?? '';
+    if (field === 'predecessors') return formatPredecessors(task.id, deps, wbsByTaskId);
     const v = task[field];
     return v != null ? String(v) : '';
   };
 
   const isDirty = (taskId) => taskId in drafts;
 
-  // Update a single field in the draft, applying formula for schedule fields.
-  // Not memoized — always fresh, no stale-closure risk.
   const updateDraft = (task, field, value) => {
     const scheduleFields = ['estimated_days', 'start_date', 'due_date'];
-    setErrors(prev => { const n = { ...prev }; delete n[task.id]; return n; });
+    setErrors(prev => { const n = {...prev}; delete n[task.id]; return n; });
+
+    if (field === 'predecessors') {
+      const parsed = parsePredecessors(value);
+      const invalid = parsed.filter(p => !rows.find(r => r._wbs === p.wbs));
+      if (invalid.length) {
+        setErrors(prev => ({ ...prev, [task.id]: `Invalid predecessor WBS: ${invalid.map(p=>p.wbs).join(', ')}` }));
+        setDrafts(prev => ({ ...prev, [task.id]: { ...prev[task.id], predecessors: value } }));
+        return;
+      }
+      // Compute new dates for this task based on parsed predecessors
+      let newStart = '', newFinish = '';
+      const taskDraft = drafts[task.id] || {};
+      const taskDays  = Number(taskDraft.estimated_days ?? task.estimated_days ?? 1);
+      for (const p of parsed) {
+        const predRow = rows.find(r => r._wbs === p.wbs);
+        if (!predRow) continue;
+        const predDraft  = drafts[predRow.id] || {};
+        const predStart  = predDraft.start_date ?? predRow.start_date ?? '';
+        const predFinish = predDraft.due_date   ?? predRow.due_date   ?? '';
+        const { start, finish } = computeSuccessorDates(predStart, predFinish, p.type, p.lag, taskDays);
+        if (start && (!newStart || start > newStart)) { newStart = start; newFinish = finish; }
+      }
+      setDrafts(prev => {
+        let nd = { ...prev, [task.id]: { ...prev[task.id], predecessors: value, ...(newStart ? { start_date: newStart, due_date: newFinish, estimated_days: String(taskDays) } : {}) } };
+        if (newStart) nd = cascadeDraftDates(task.id, newStart, newFinish, rows, deps, nd);
+        return nd;
+      });
+      return;
+    }
 
     if (scheduleFields.includes(field)) {
       setDrafts(prev => {
-        // Build current schedule from LATEST prev state (never stale)
         const existing = prev[task.id] || {};
         const current = {
           estimated_days: existing.estimated_days ?? String(task.estimated_days ?? ''),
@@ -193,23 +292,22 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         };
         const result = applyScheduleFormula(current, field, value);
         if (result.error) {
-          // Store error but still record what the user typed
           setTimeout(() => setErrors(e => ({ ...e, [task.id]: result.error })), 0);
           return { ...prev, [task.id]: { ...existing, [field]: value } };
         }
-        return {
+        let nd = {
           ...prev,
-          [task.id]: {
-            ...existing,
-            estimated_days: result.estimated_days,
-            start_date:     result.start_date,
-            due_date:       result.due_date,
-          },
+          [task.id]: { ...existing, estimated_days: result.estimated_days, start_date: result.start_date, due_date: result.due_date },
         };
+        nd = cascadeDraftDates(task.id, result.start_date, result.due_date, rows, deps, nd);
+        nd = rollupParent(task.id, rows, deps, nd);
+        return nd;
       });
-    } else {
-      setDrafts(prev => ({ ...prev, [task.id]: { ...prev[task.id], [field]: value } }));
+      return;
     }
+
+    // non-schedule fields
+    setDrafts(prev => ({ ...prev, [task.id]: { ...prev[task.id], [field]: value } }));
   };
 
   const discardDraft = useCallback((taskId) => {
@@ -217,17 +315,30 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     setErrors(prev => { const n = { ...prev }; delete n[taskId]; return n; });
   }, []);
 
-  // ── Save row ─────────────────────────────────────────────────────────────
+  // ── Save row ──────────────────────────────────────────────────────────────
   const saveRow = useCallback(async (task) => {
     const draft = drafts[task.id] || {};
-    if (errors[task.id]) return; // don't save if there's a validation error
-
+    if (errors[task.id]) return;
     setSaving(prev => new Set(prev).add(task.id));
 
     const merged = { ...task, ...draft };
-
-    // Coerce types
     const estDays = Math.max(0, Math.min(9999, Number(merged.estimated_days) || 0));
+
+    // Build dependencies array if predecessors draft present
+    let dependencies = null;
+    if ('predecessors' in draft) {
+      const predsStr = draft.predecessors ?? '';
+      if (!predsStr.trim()) {
+        dependencies = [];
+      } else {
+        const parsed = parsePredecessors(predsStr);
+        dependencies = parsed.map(p => {
+          const predRow = rows.find(r => r._wbs === p.wbs);
+          return predRow ? { predecessor_id: predRow.id, type: p.type, lag: p.lag } : null;
+        }).filter(Boolean);
+      }
+    }
+
     const body = {
       title:           (merged.title || '').trim() || task.title,
       description:     merged.description || '',
@@ -235,26 +346,35 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       priority:        merged.priority || task.priority,
       assignee_id:     merged.assignee_id ? Number(merged.assignee_id) : null,
       labels:          merged.labels || '',
+      notes:           (merged.notes || '').slice(0, 200),
       start_date:      merged.start_date || null,
       due_date:        merged.due_date   || null,
       estimated_hours: Number(merged.estimated_hours) || 0,
       estimated_days:  estDays,
       logged_hours:    Number(merged.logged_hours)    || 0,
+      ...(dependencies !== null ? { dependencies } : {}),
     };
 
-    if (!body.title) { setErrors(prev => ({ ...prev, [task.id]: 'Title is required' })); setSaving(prev => { const s = new Set(prev); s.delete(task.id); return s; }); return; }
+    if (!body.title) {
+      setErrors(prev => ({ ...prev, [task.id]: 'Title is required' }));
+      setSaving(prev => { const s = new Set(prev); s.delete(task.id); return s; });
+      return;
+    }
 
     try {
-      const res = await authFetch(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      const res  = await authFetch(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
       const json = await res.json();
       if (!res.ok) { setErrors(prev => ({ ...prev, [task.id]: json.error || 'Save failed' })); return; }
 
       const { task: updated, affected } = json;
-
-      // Clear draft for this task
       discardDraft(task.id);
 
-      // Update rows + propagate affected successors
+      // Reload deps from server after predecessor save
+      if (dependencies !== null) {
+        authFetch(`/api/projects/${project.id}/dependencies`)
+          .then(r => r.ok ? r.json() : []).then(setDeps).catch(() => {});
+      }
+
       setRows(prev => {
         const next = prev.map(r => r.id === updated.id ? { ...r, ...updated } : r);
         if (!affected?.length) return next;
@@ -265,10 +385,17 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
         if (!affected?.length) return next;
         return next.map(t => { const a = affected.find(x => x.id === t.id); return a ? { ...t, ...a } : t; });
       });
+      if (affected?.length) {
+        setDrafts(prev => {
+          const nd = { ...prev };
+          affected.forEach(t => { delete nd[t.id]; });
+          return nd;
+        });
+      }
     } finally {
       setSaving(prev => { const s = new Set(prev); s.delete(task.id); return s; });
     }
-  }, [drafts, errors, authFetch, discardDraft, onTasksChange]);
+  }, [drafts, errors, authFetch, discardDraft, onTasksChange, rows, deps, project.id]);
 
   // ── Row CRUD ───────────────────────────────────────────────────────────────
   const createRow = useCallback(async (afterIdx, parentId = null) => {
@@ -313,10 +440,11 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
 
   // ── Render one cell ────────────────────────────────────────────────────────
   const renderCell = (task, rowIdx, col) => {
-    const w       = colWidths[col];
-    const cellId  = `cell-${rowIdx}-${col}`;
-    const dirty   = isDirty(task.id);
+    const w        = colWidths[col];
+    const cellId   = `cell-${rowIdx}-${col}`;
+    const dirty    = isDirty(task.id);
     const isSaving = saving.has(task.id);
+    const isParent = parentIds.has(task.id);
 
     if (col === 'wbs') {
       const hasChildren = parentIds.has(task.id);
@@ -331,8 +459,18 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     }
 
     if (col === 'predecessors') return (
-      <td key={col} className="wbs-grid-cell wbs-cell-text" style={{ width: w, minWidth: w }}>
-        <span className="wbs-cell-val">{getPredecessorStr(task.id) || <span className="wbs-empty">—</span>}</span>
+      <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
+        <input
+          id={cellId}
+          className="wbs-inline-input"
+          disabled={isSaving}
+          value={val(task, 'predecessors')}
+          onChange={e => updateDraft(task, 'predecessors', e.target.value)}
+          onBlur={e => updateDraft(task, 'predecessors', e.target.value)}
+          onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
+          placeholder="e.g. 2, 3FS+1"
+          title="Format: WBS[type][±lag], e.g. 2FS, 3FF+1"
+        />
       </td>
     );
 
@@ -361,37 +499,62 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       </td>
     );
 
-    if (col === 'priority') return (
+    if (col === 'notes') return (
       <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
-        <select id={cellId} className="wbs-inline-select" disabled={isSaving}
-          value={val(task, 'priority')}
-          onChange={e => updateDraft(task, 'priority', e.target.value)}
+        <input
+          id={cellId}
+          className="wbs-inline-input wbs-notes-input"
+          disabled={isSaving}
+          maxLength={200}
+          value={val(task, 'notes')}
+          onChange={e => updateDraft(task, 'notes', e.target.value.slice(0, 200))}
           onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
-        >
-          {PRIORITY_OPTIONS.map(p => <option key={p} value={p}>{p}</option>)}
-        </select>
-      </td>
-    );
-
-    if (col === 'start_date' || col === 'due_date') return (
-      <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
-        <input id={cellId} type="date" className="wbs-inline-input wbs-date-input-cell" disabled={isSaving}
-          value={val(task, col)}
-          onChange={e => updateDraft(task, col, e.target.value)}
-          onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
+          placeholder="Notes…"
         />
       </td>
     );
 
-    if (col === 'estimated_days') return (
-      <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
-        <input id={cellId} type="number" min="0" step="1" className="wbs-inline-input wbs-num-input" disabled={isSaving}
-          value={val(task, 'estimated_days')}
-          onChange={e => updateDraft(task, 'estimated_days', e.target.value)}
-          onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
-        />
-      </td>
-    );
+    if (col === 'start_date' || col === 'due_date') {
+      if (isParent) {
+        return (
+          <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
+            <span className="wbs-cell-locked" title="Dates computed from subtasks">
+              {val(task, col) || '—'}
+            </span>
+          </td>
+        );
+      }
+      return (
+        <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
+          <input id={cellId} type="date" className="wbs-inline-input wbs-date-input-cell" disabled={isSaving}
+            value={val(task, col)}
+            onChange={e => updateDraft(task, col, e.target.value)}
+            onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
+          />
+        </td>
+      );
+    }
+
+    if (col === 'estimated_days') {
+      if (isParent) {
+        return (
+          <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
+            <span className="wbs-cell-locked" title="Dates computed from subtasks">
+              {val(task, col) || '—'}
+            </span>
+          </td>
+        );
+      }
+      return (
+        <td key={col} className="wbs-grid-cell" style={{ width: w, minWidth: w }}>
+          <input id={cellId} type="number" min="0" step="1" className="wbs-inline-input wbs-num-input" disabled={isSaving}
+            value={val(task, 'estimated_days')}
+            onChange={e => updateDraft(task, 'estimated_days', e.target.value)}
+            onKeyDown={e => { if (e.key === 'Tab') handleTab(e, rowIdx, col); }}
+          />
+        </td>
+      );
+    }
 
     // Title
     const indent = task._depth * 20;

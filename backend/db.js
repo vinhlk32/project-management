@@ -128,6 +128,14 @@ async function initializeDatabase() {
       await conn.execute('ALTER TABLE tasks ADD COLUMN estimated_days INT NOT NULL DEFAULT 0 AFTER estimated_hours');
     }
 
+    // Migration: add notes column for inline task notes
+    const [notesCheck] = await conn.execute(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tasks' AND COLUMN_NAME = 'notes'"
+    );
+    if (!notesCheck.length) {
+      await conn.execute("ALTER TABLE tasks ADD COLUMN notes VARCHAR(200) NOT NULL DEFAULT '' AFTER estimated_days");
+    }
+
     // task_dependencies
     await conn.execute(`
       CREATE TABLE IF NOT EXISTS task_dependencies (

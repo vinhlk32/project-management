@@ -3003,3 +3003,24 @@ body {
   font-size: 11px;
   padding: 3px 12px !important;
 }
+
+/* Parent date cells locked (read-only, dates derived from subtasks) */
+.wbs-cell-locked {
+  display: block;
+  width: 100%;
+  padding: 3px 6px;
+  font-size: 12px;
+  color: #94a3b8;
+  background: #1a2332;
+  cursor: not-allowed;
+  user-select: none;
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Notes inline input */
+.wbs-notes-input {
+  font-style: italic;
+}

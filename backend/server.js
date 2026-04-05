@@ -324,7 +324,7 @@ app.get('/api/projects/:id/tasks', async (req, res) => {
 
 app.post('/api/tasks', async (req, res) => {
   try {
-    const { project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, parent_id, dependencies } = req.body;
+    const { project_id, title, description, status, priority, assignee_id, labels, notes, start_date, due_date, estimated_hours, estimated_days, parent_id, dependencies } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
     if (title.trim().length > 300) return res.status(400).json({ error: 'Title too long (max 300)' });
     if (description && description.length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
@@ -336,18 +336,19 @@ app.post('/api/tasks', async (req, res) => {
     const hours = Number(estimated_hours) || 0;
     if (hours < 0 || hours > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
     const eDays = Math.max(0, Math.min(9999, Number(estimated_days) || 0));
+    const safeNotes = (notes || '').slice(0, 200);
 
     // Auto-calculate due_date from start_date + estimated_days if not explicitly provided
     let calcDue = due_date || null;
     if (eDays > 0 && start_date && !due_date) calcDue = addDays(start_date, eDays - 1);
 
     const result = await db.execute({
-      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, parent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT INTO tasks (project_id, title, description, status, priority, assignee_id, labels, notes, start_date, due_date, estimated_hours, estimated_days, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         project_id, title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
-        assignee_id || null, (labels || '').slice(0, 500),
+        assignee_id || null, (labels || '').slice(0, 500), safeNotes,
         start_date || null, calcDue,
         hours, eDays, parent_id || null,
       ],
@@ -414,7 +415,7 @@ app.post('/api/tasks', async (req, res) => {
 
 app.put('/api/tasks/:id', async (req, res) => {
   try {
-    const { title, description, status, priority, assignee_id, labels, start_date, due_date, estimated_hours, estimated_days, logged_hours } = req.body;
+    const { title, description, status, priority, assignee_id, labels, notes, start_date, due_date, estimated_hours, estimated_days, logged_hours, dependencies } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
     if (title.trim().length > 300) return res.status(400).json({ error: 'Title too long (max 300)' });
     if (description && description.length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
@@ -426,23 +427,44 @@ app.put('/api/tasks/:id', async (req, res) => {
     const logH = Number(logged_hours) || 0;
     if (estH < 0 || estH > 9999) return res.status(400).json({ error: 'Invalid estimated_hours' });
     if (logH < 0 || logH > 9999) return res.status(400).json({ error: 'Invalid logged_hours' });
+    const safeNotes = (notes || '').slice(0, 200);
 
     // Validate start/due ordering
     if (start_date && due_date && due_date < start_date) {
       return res.status(400).json({ error: 'Finish date cannot be before start date' });
     }
 
+    // If dependencies array is present, atomically replace all deps for this task
+    if (Array.isArray(dependencies)) {
+      const successorId = Number(req.params.id);
+      await db.execute({ sql: 'DELETE FROM task_dependencies WHERE successor_id = ?', args: [successorId] });
+      for (const dep of dependencies) {
+        const { predecessor_id, type, lag } = dep;
+        if (!isValidId(predecessor_id) || Number(predecessor_id) === successorId) continue;
+        const depType = VALID_DEP_TYPES.includes(type) ? type : 'FS';
+        const lagVal = Number.isInteger(Number(lag)) ? Math.max(-999, Math.min(999, Number(lag))) : 0;
+        try {
+          await db.execute({
+            sql: 'INSERT INTO task_dependencies (predecessor_id, successor_id, type, `lag`) VALUES (?, ?, ?, ?)',
+            args: [predecessor_id, successorId, depType, lagVal],
+          });
+        } catch (depErr) {
+          if (!depErr.message?.includes('UNIQUE') && !depErr.message?.includes('Duplicate entry')) throw depErr;
+        }
+      }
+    }
+
     // Trust the frontend to have resolved (start_date, due_date, estimated_days) consistently.
     // Do not auto-override here so that direct due_date edits are preserved.
     await db.execute({
       sql: `UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?,
-            assignee_id = ?, labels = ?, start_date = ?, due_date = ?,
+            assignee_id = ?, labels = ?, notes = ?, start_date = ?, due_date = ?,
             estimated_hours = ?, estimated_days = ?, logged_hours = ?
             WHERE id = ?`,
       args: [
         title.trim(), (description || '').trim(),
         status || 'todo', priority || 'medium',
-        assignee_id || null, (labels || '').slice(0, 500),
+        assignee_id || null, (labels || '').slice(0, 500), safeNotes,
         start_date || null, due_date || null,
         estH, estD, logH,
         req.params.id,
