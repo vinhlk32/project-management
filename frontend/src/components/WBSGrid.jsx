@@ -276,7 +276,10 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
       }
       setDrafts(prev => {
         let nd = { ...prev, [task.id]: { ...prev[task.id], predecessors: value, ...(newStart ? { start_date: newStart, due_date: newFinish, estimated_days: String(taskDays) } : {}) } };
-        if (newStart) nd = cascadeDraftDates(task.id, newStart, newFinish, rows, deps, nd);
+        if (newStart) {
+          nd = cascadeDraftDates(task.id, newStart, newFinish, rows, deps, nd);
+          nd = rollupParent(task.id, rows, deps, nd);
+        }
         return nd;
       });
       return;
@@ -571,10 +574,37 @@ export default function WBSGrid({ project, tasks: allTasks, users = [], onTasksC
     );
   };
 
+  // ── Save / Discard All ────────────────────────────────────────────────────
+  const dirtyCount = Object.keys(drafts).length;
+
+  const saveAll = useCallback(async () => {
+    const dirtyTasks = rows.filter(r => r.id in drafts);
+    for (const task of dirtyTasks) await saveRow(task);
+  }, [rows, drafts, saveRow]);
+
+  const discardAll = useCallback(() => {
+    setDrafts({});
+    setErrors({});
+  }, []);
+
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="wbs-grid-wrap">
       <div className="wbs-grid-toolbar">
+        {dirtyCount > 0 && (
+          <>
+            <button className="wbs-action-btn wbs-action-save wbs-toolbar-bulk-btn"
+              onClick={saveAll}
+              title="Save all unsaved rows">
+              ✓ Save All ({dirtyCount})
+            </button>
+            <button className="wbs-action-btn wbs-action-discard wbs-toolbar-bulk-btn"
+              onClick={discardAll}
+              title="Discard all unsaved changes">
+              ↺ Discard All
+            </button>
+          </>
+        )}
         <span className="wbs-grid-hint">
           Edit cells freely · formula runs live · click <strong>✓</strong> to save a row · <kbd>Tab</kbd> moves between cells
         </span>
