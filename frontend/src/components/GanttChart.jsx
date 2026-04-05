@@ -33,7 +33,7 @@ const PRIORITY_COLOR = { low: '#22c55e', medium: '#f59e0b', high: '#f97316', cri
 const toDate      = s    => new Date(s + 'T00:00:00');
 const daysBetween = (a, b) => Math.round((b - a) / 86_400_000);
 const addDays     = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
-const isoDate     = d    => d.toISOString().split('T')[0];
+const isoDate     = d    => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
 function fmtShort(dateStr) {
   if (!dateStr) return null;
@@ -145,6 +145,7 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
   const { authFetch } = useAuth();
   const [zoom,        setZoom]        = useState('week');
   const [deps,        setDeps]        = useState([]);
+  const [showCP,      setShowCP]      = useState(false);
   const [nameW,       setNameW]       = useState(DEFAULT_W);
   const [editingCell, setEditingCell] = useState(null); // { taskId, field }
   const [dragging,    setDragging]    = useState(false);
@@ -228,6 +229,43 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
   const todayX   = daysBetween(timelineStart, todayD) * dayPx;
   const todayStr = isoDate(todayD);
 
+  // ── Critical Path (CPM) ────────────────────────────────────────────────────
+  const criticalIds = useMemo(() => {
+    if (!showCP || !tasks.length) return new Set();
+    const dur = t => Math.max(1, t.estimated_days > 0 ? t.estimated_days
+      : (t.start_date && t.due_date ? daysBetween(toDate(t.start_date), toDate(t.due_date)) + 1 : 1));
+    const fsDeps = deps.filter(d => d.type === 'FS');
+    const succs = {}, preds = {};
+    tasks.forEach(t => { succs[t.id] = []; preds[t.id] = []; });
+    fsDeps.forEach(d => { if (succs[d.predecessor_id]) succs[d.predecessor_id].push(d); if (preds[d.successor_id]) preds[d.successor_id].push(d); });
+    // Kahn topological sort
+    const inDeg = {}; tasks.forEach(t => { inDeg[t.id] = preds[t.id].length; });
+    const queue = tasks.filter(t => inDeg[t.id] === 0).map(t => t.id);
+    const order = [];
+    while (queue.length) {
+      const id = queue.shift(); order.push(id);
+      succs[id]?.forEach(d => { if (--inDeg[d.successor_id] === 0) queue.push(d.successor_id); });
+    }
+    // Forward pass: ES / EF
+    const ES = {}, EF = {};
+    order.forEach(id => {
+      const t = tasks.find(x => x.id === id); if (!t) return;
+      const pe = preds[id].map(d => (EF[d.predecessor_id] ?? 0) + (d.lag || 0) + 1);
+      ES[id] = pe.length ? Math.max(...pe) : 0;
+      EF[id] = ES[id] + dur(t) - 1;
+    });
+    // Backward pass: LS / LF
+    const end = Math.max(0, ...Object.values(EF));
+    const LS = {}, LF = {};
+    [...order].reverse().forEach(id => {
+      const t = tasks.find(x => x.id === id); if (!t) return;
+      const sl = succs[id].map(d => (LS[d.successor_id] ?? end) - (d.lag || 0) - 1);
+      LF[id] = sl.length ? Math.min(...sl) : end;
+      LS[id] = LF[id] - dur(t) + 1;
+    });
+    return new Set(order.filter(id => (LS[id] ?? 0) - (ES[id] ?? 0) === 0));
+  }, [showCP, tasks, deps]);
+
   // ── Bar positions ──────────────────────────────────────────────────────────
   const barPos = useMemo(() => {
     const map = {};
@@ -283,6 +321,9 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
               {label}
             </button>
           ))}
+          <button className={`zoom-btn${showCP ? ' active' : ''}`} onClick={() => setShowCP(v => !v)} title="Highlight critical path (zero float)">
+            Critical Path
+          </button>
         </div>
         <div className="gantt-toolbar-hint">
           Drag <span className="gantt-hint-icon">⇔</span> divider to expand WBS · Click dates to edit inline
@@ -297,6 +338,11 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
           <span className="legend-item">
             <span className="legend-dot" style={{ background: '#ff6b6b' }} /> Overdue
           </span>
+          {showCP && (
+            <span className="legend-item">
+              <span className="legend-dot" style={{ background: '#ef4444' }} /> Critical
+            </span>
+          )}
         </div>
       </div>
 
@@ -489,12 +535,13 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
               {tasks.map((t, i) => {
                 const pos = barPos[t.id];
                 if (!pos) return null;
-                const overdue = t.due_date && t.status !== 'done' && toDate(t.due_date) < todayD;
-                const color   = overdue ? '#ff6b6b' : STATUS_COLOR[t.status];
+                const overdue     = t.due_date && t.status !== 'done' && toDate(t.due_date) < todayD;
+                const isCritical  = showCP && criticalIds.has(t.id);
+                const color       = isCritical ? '#ef4444' : overdue ? '#ff6b6b' : STATUS_COLOR[t.status];
                 return (
                   <div
                     key={t.id}
-                    className="gantt-bar"
+                    className={`gantt-bar${isCritical ? ' gantt-bar-critical' : ''}`}
                     style={{ left: pos.left, top: i * ROW_H + BAR_Y, width: pos.width, background: color }}
                     onClick={() => onEditTask(t)}
                     title={`${t.title}${t.start_date ? '\n▶ ' + t.start_date : ''}${t.due_date ? '\n■ ' + t.due_date : ''}`}
@@ -512,6 +559,9 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
                   <marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
                     <path d="M0,0 L0,7 L7,3.5 z" fill="#64748b" />
                   </marker>
+                  <marker id="arr-crit" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+                    <path d="M0,0 L0,7 L7,3.5 z" fill="#ef4444" />
+                  </marker>
                 </defs>
                 {deps.map(dep => {
                   const pred = barPos[dep.predecessor_id];
@@ -519,8 +569,12 @@ export default function GanttChart({ project, tasks, onEditTask, onDateChange, r
                   if (!pred || !succ) return null;
                   const d = arrowPath(dep.type, pred, succ);
                   if (!d) return null;
+                  const isCritArrow = showCP && dep.type === 'FS' && criticalIds.has(dep.predecessor_id) && criticalIds.has(dep.successor_id);
                   return (
-                    <path key={dep.id} d={d} fill="none" stroke="#64748b" strokeWidth="1.5" markerEnd="url(#arr)" />
+                    <path key={dep.id} d={d} fill="none"
+                      stroke={isCritArrow ? '#ef4444' : '#64748b'}
+                      strokeWidth={isCritArrow ? 2 : 1.5}
+                      markerEnd={isCritArrow ? 'url(#arr-crit)' : 'url(#arr)'} />
                   );
                 })}
               </svg>

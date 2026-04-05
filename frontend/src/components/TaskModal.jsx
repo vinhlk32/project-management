@@ -3,6 +3,12 @@ import CommentSection from './CommentSection';
 import { useAuth } from '../context/AuthContext';
 
 const DEP_TYPES = ['FS', 'SS', 'FF', 'SF'];
+
+function addDaysLocal(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 const DEP_LABELS = {
   FS: 'FS — Finish to Start',
   SS: 'SS — Start to Start',
@@ -71,7 +77,9 @@ export default function TaskModal({
   const [startDate, setStartDate] = useState(task?.start_date || '');
   const [dueDate, setDueDate] = useState(task?.due_date || '');
   const [estimatedHours, setEstimatedHours] = useState(task?.estimated_hours || '');
+  const [estimatedDays, setEstimatedDays]   = useState(task?.estimated_days  || '');
   const [loggedHours, setLoggedHours] = useState(task?.logged_hours || '');
+  const [notes, setNotes] = useState(task?.notes || '');
 
   // Dependencies for existing task (fetched from API)
   const [deps, setDeps] = useState([]);
@@ -103,6 +111,31 @@ export default function TaskModal({
       .then(setSubtasks);
   }, [task?.id]);
 
+  // Auto-calculate dates from FS predecessors + estimated_days (create mode)
+  useEffect(() => {
+    if (isEditing || !estimatedDays || Number(estimatedDays) <= 0) return;
+    const fsDeps = pendingDeps.filter(d => d.type === 'FS');
+    if (!fsDeps.length) return;
+    let latestDue = null; let latestLag = 0;
+    for (const dep of fsDeps) {
+      const pred = (projectTasks || []).find(t => t.id === dep.predecessor_id);
+      if (pred?.due_date && (!latestDue || pred.due_date > latestDue)) {
+        latestDue = pred.due_date; latestLag = dep.lag || 0;
+      }
+    }
+    if (!latestDue) return;
+    const autoStart = addDaysLocal(latestDue, latestLag + 1);
+    const autoDue   = addDaysLocal(autoStart, Number(estimatedDays) - 1);
+    setStartDate(autoStart);
+    setDueDate(autoDue);
+  }, [pendingDeps, estimatedDays]);
+
+  // Recalculate due_date when estimated_days or start_date changes (both modes)
+  useEffect(() => {
+    if (!estimatedDays || Number(estimatedDays) <= 0 || !startDate) return;
+    setDueDate(addDaysLocal(startDate, Number(estimatedDays) - 1));
+  }, [estimatedDays, startDate]);
+
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!title.trim()) return;
@@ -113,9 +146,11 @@ export default function TaskModal({
       priority,
       assignee_id: assigneeId ? Number(assigneeId) : null,
       labels: labels.join(','),
+      notes: notes.slice(0, 200),
       start_date: startDate || null,
       due_date: dueDate || null,
       estimated_hours: estimatedHours ? Number(estimatedHours) : 0,
+      estimated_days:  estimatedDays  ? Number(estimatedDays)  : 0,
       logged_hours: loggedHours ? Number(loggedHours) : 0,
       // Only include dependencies on create
       ...(!isEditing && pendingDeps.length > 0 && {
@@ -368,6 +403,18 @@ export default function TaskModal({
 
             <div className="form-row">
               <div className="form-field">
+                <label>Duration (days)</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={estimatedDays}
+                  onChange={e => setEstimatedDays(e.target.value)}
+                  placeholder="0"
+                  title="Sets duration; auto-calculates Finish date from Start"
+                />
+              </div>
+              <div className="form-field">
                 <label>Estimated Hours</label>
                 <input
                   type="number"
@@ -391,6 +438,17 @@ export default function TaskModal({
                   />
                 </div>
               )}
+            </div>
+
+            <div className="form-field">
+              <label>Notes <span className="label-hint">({notes.length}/200)</span></label>
+              <input
+                type="text"
+                value={notes}
+                onChange={e => setNotes(e.target.value.slice(0, 200))}
+                maxLength={200}
+                placeholder="Short note…"
+              />
             </div>
 
             {/* ── Dependencies section for new task creation ── */}
