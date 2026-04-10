@@ -11,18 +11,7 @@
  * Maintains each task's duration when shifting.
  */
 
-function addDays(dateStr, days) {
-  if (!dateStr) return null;
-  const d = new Date(dateStr + 'T00:00:00Z');
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().split('T')[0];
-}
-
-function daysBetween(a, b) {
-  if (!a || !b) return null;
-  const ms = new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z');
-  return Math.round(ms / 86400000);
-}
+const { addDays, daysBetween } = require('./utils/dates');
 
 async function getTask(db, id) {
   const r = await db.execute({ sql: 'SELECT * FROM tasks WHERE id = ?', args: [id] });
@@ -128,4 +117,4 @@ async function propagateDates(db, changedTaskId, visited = new Set()) {
   return updated;
 }
 
-module.exports = { propagateDates, addDays };
+module.exports = { propagateDates, addDays, daysBetween };

@@ -5,7 +5,9 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const { db, initializeDatabase, cleanupExpiredTokens } = require('./db');
-const { propagateDates, addDays } = require('./propagate');
+const { propagateDates } = require('./propagate');
+const { addDays } = require('./utils/dates');
+const { wouldCreateCycle } = require('./utils/graph');
 const requireAuth = require('./middleware/requireAuth');
 const requireRole = require('./middleware/requireRole');
 const authRoutes = require('./routes/authRoutes');
@@ -310,14 +312,19 @@ app.delete('/api/users/:id', requireRole('admin'), async (req, res) => {
 
 app.get('/api/projects/:id/tasks', async (req, res) => {
   try {
-    const result = await db.execute({
-      sql: `SELECT t.*, u.name AS assignee_name, u.avatar_color AS assignee_color
-            FROM tasks t
-            LEFT JOIN users u ON u.id = t.assignee_id
-            WHERE t.project_id = ?
-            ORDER BY t.created_at DESC`,
-      args: [req.params.id],
-    });
+    const limit  = req.query.limit  ? Math.min(Math.max(Number(req.query.limit),  1), 500) : null;
+    const offset = req.query.offset ? Math.max(Number(req.query.offset), 0) : 0;
+
+    const sql = limit !== null
+      ? `SELECT t.*, u.name AS assignee_name, u.avatar_color AS assignee_color
+         FROM tasks t LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE t.project_id = ? ORDER BY t.created_at DESC
+         LIMIT ${limit} OFFSET ${offset}`
+      : `SELECT t.*, u.name AS assignee_name, u.avatar_color AS assignee_color
+         FROM tasks t LEFT JOIN users u ON u.id = t.assignee_id
+         WHERE t.project_id = ? ORDER BY t.created_at DESC`;
+
+    const result = await db.execute({ sql, args: [req.params.id] });
     res.json(result.rows);
   } catch (err) { handleError(res, err); }
 });
@@ -739,12 +746,6 @@ app.get('/api/projects/:id/conflicts', async (req, res) => {
       args: [projectId],
     });
 
-    function addDays(dateStr, days) {
-      const d = new Date(dateStr + 'T00:00:00');
-      d.setDate(d.getDate() + days);
-      return d.toISOString().split('T')[0];
-    }
-
     for (const d of depResult.rows) {
       const lag = d.lag || 0;
       let violated = false;
@@ -793,25 +794,6 @@ app.get('/api/projects/:id/conflicts', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-// ── Cycle detection ───────────────────────────────────────────────────────────
-
-async function wouldCreateCycle(db, startId, targetId) {
-  const visited = new Set();
-  const queue = [startId];
-  while (queue.length) {
-    const current = queue.shift();
-    if (current === targetId) return true;
-    if (visited.has(current)) continue;
-    visited.add(current);
-    const result = await db.execute({
-      sql: 'SELECT successor_id FROM task_dependencies WHERE predecessor_id = ?',
-      args: [current],
-    });
-    for (const row of result.rows) queue.push(row.successor_id);
-  }
-  return false;
-}
-
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
@@ -821,7 +803,17 @@ async function startWithRetry(retries = 10, delayMs = 3000) {
     try {
       await initializeDatabase();
       cleanupExpiredTokens();
-      app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
+      const server = app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
+
+      // ── Graceful shutdown ──────────────────────────────────────────────────
+      process.on('SIGTERM', () => {
+        console.log('SIGTERM received — shutting down gracefully');
+        server.close(() => {
+          console.log('HTTP server closed');
+          process.exit(0);
+        });
+      });
+
       return;
     } catch (err) {
       console.error(`DB not ready (attempt ${i}/${retries}): ${err.message}`);
@@ -834,4 +826,18 @@ async function startWithRetry(retries = 10, delayMs = 3000) {
   }
 }
 
-startWithRetry();
+// ── Process-level error guards ─────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error({ event: 'unhandledRejection', reason });
+});
+
+process.on('uncaughtException', (err) => {
+  console.error({ event: 'uncaughtException', err: err.message, stack: err.stack });
+  process.exit(1);
+});
+
+module.exports = app;
+
+if (require.main === module) {
+  startWithRetry();
+}

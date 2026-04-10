@@ -1,12 +1,12 @@
 # ── Stage 1: install dependencies (bcrypt needs native build tools) ────────────
-FROM node:18-alpine AS deps
+FROM node:20.19-alpine3.21 AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN apk add --no-cache python3 make g++ \
  && npm ci --omit=dev
 
 # ── Stage 2: lean runtime image ────────────────────────────────────────────────
-FROM node:18-alpine
+FROM node:20.19-alpine3.21
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
